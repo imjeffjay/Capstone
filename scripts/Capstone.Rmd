@@ -1,0 +1,3690 @@
+---
+title: "DS 795 - Capstone Project"
+author: "Jeff Jay"
+date: "2025-02-13"
+output:
+  # pdf_document:
+  html_document:
+    theme: cerulean
+    toc: true
+    toc_float:
+      collapsed: true    
+      smooth_scroll: false 
+
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+
+# install.packages(c("arm","gbm","class","elmNN","kernlab")
+
+# data mgmt & analysis
+library(here)
+library(bigrquery)
+library(DBI)
+library(tidyverse)
+library(GGally)  
+library(lattice)
+library(MASS)
+library(dplyr)
+library(car)
+library(corrplot)
+library(broom)
+library(scales)  
+library(glue)
+library(doParallel)
+
+# Training, validation, tuning, evalutaion
+library(caret)
+library(yardstick)
+library(pROC)
+library(PRROC)
+library(smotefamily)
+library(SHAPforxgboost)
+library(iml) 
+library(shapper)
+
+# Model
+library(xgboost)      # Extreme Gradient Boosting
+library(gbm)          # Gradient Boosting Machines Log Reg
+library(randomForest) # Random Forest Tree
+library(glmnet)       # Logistic Regression
+library(arm)          # Bayesian Logistic Regression
+library(nnet)         # Neural Network
+library(class)        # K-Nearest Neighbors
+library(kernlab)      # SVM's
+library(e1071)        # SVM's
+library(naivebayes)   # Naive Bayes
+
+# visualization
+library(ggplot2)
+library(ggcorrplot)
+library(gridExtra)
+library(reshape2)
+
+#tables
+library(formattable)
+library(knitr)  
+library(kableExtra) 
+
+# CPU? Set Cores
+num_cores <- parallel::detectCores() - 1
+registerDoParallel(cores = num_cores)
+cat("Registered", num_cores, "cores for parallel training.\n")
+
+```
+
+### Load Function and Figures
+
+```{r load.support.scripts}
+
+# Load Featurte Sets
+source(here("scripts", "feature_sets.R"))
+# Load utilities
+source(here("scripts", "utils.R"))
+
+```
+
+#### Connections
+
+1. MIMIC-IV (Hospital. ICU, & ER)
+2. IPUMS: Census/ACS - Weighted Averages of Cross-tabulations
+    - Suffolk County Massachusetts grouped by Marital Status, Insurance type, and race.
+    > IPUMS provided individualized Harmonizes data Suffolk County Massachusetts grouped by Marital Status, Insurance type, and race.
+
+```{r dataset.build}
+
+# Connect to BigQuery
+source(here("scripts", "bigquery_connect.R"))
+
+# Run SQL and process and save data by size
+sample_sizes <- c(5, 10, 25, 50, 100)
+
+# Loop each sample size
+for (sp in sample_sizes) {
+  sample_percent <- sp
+  source(here("scripts", "process_data.R"))
+  # clear
+  rm(list = ls(pattern = "^data"), envir = .GlobalEnv)
+  gc()
+  message("Dataset saved, memory cleared")
+}
+
+```
+
+```{r dataset.load.eda}
+
+# Load 25% Data Sample for EDA
+data_hosp <- load_dataset("data_hosp_25.rds")
+data_cms  <- load_dataset("data_cms_25.rds")
+data_ICU  <- load_dataset("data_ICU_25.rds")
+
+# Load Functions
+source(here("scripts", "figs_funcs.R"))
+
+```
+
+### EDA
+
+```{r eda.4.4.0}
+
+## Summaries
+summary(data_hosp)
+str(data_hosp)
+head(data_hosp)
+unique_counts <- sapply(data_hosp, function(x) length(unique(x)))
+hosp_val_counts <- data.frame(Feature = names(unique_counts), Unique_Count = unique_counts)
+hosp_val_counts <- hosp_val_counts[order(-hosp_val_counts$Unique_Count), ]; hosp_val_counts
+
+cat("CMS Diagnosis only DF size:", dim(data_cms), "\n")
+cat("ICU patients only DF size:", dim(data_ICU), "\n")
+
+```
+
+#### Given ICU is a subset of hospital dataset, we will review ICU features using onyl ICU patients, otherwise 0/null would dominate the distributions. Conversly we will only look at hospitalwide variables in the full hospital dataset.
+
+```{r r eda.4.4.1-3}
+
+# numeric target histograms
+f_4_4_1_EDA_target_hist <- grid.arrange(grobs = plots$hist_list, ncol = 1)
+
+# binary target bar charts
+f_4_4_2_EDA_target_bar <- grid.arrange(grobs = plots$bar_list, ncol = 3)
+
+# summary table
+f_4_4_3_EDA_target_percent <- binary_summary_table; f_4_4_3_EDA_target_percent
+
+ggsave("../presentations/figures/f_4_4_1_EDA_target_hist.png", plot = f_4_4_1_EDA_target_hist, width = 5, height = 2, dpi = 300)
+ggsave("../presentations/figures/f_4_4_2_EDA_target_bar.png", plot = f_4_4_2_EDA_target_bar, width = 5, height = 2, dpi = 300)
+save_kable(f_4_4_3_EDA_target_percent, file = "../presentations/figures/f_4_4_3_EDA_target_percent.png")
+
+```
+
+```{r eda.4.4.4.4-5}
+
+f_4_4_4_EDA_icu_boxplot <- plot_horizontal_box(data_ICU, icu_features)
+for (name in names(f_4_4_4_EDA_icu_boxplot)) {
+  save_named_plot(f_4_4_4_EDA_icu_boxplot[[name]], 
+                  paste0("f_4_4_4_boxplot_", name),
+                  width = 4, height = 2, dpi = 400)
+}
+
+continuous_nonICU <- setdiff(continuous_features, icu_features)
+f_4_4_5_EDA_hosp_boxplot <-plot_horizontal_box(data_hosp, continuous_nonICU)
+for (name in names(f_4_4_5_EDA_hosp_boxplot)) {
+  save_named_plot(f_4_4_5_EDA_hosp_boxplot[[name]], 
+                  paste0("f_4_4_5_boxplot_", name),
+                  width = 4, height = 2, dpi = 400)
+}
+```
+
+```{r eda.4.4.6.1}
+
+# categorical features to visualize
+categorical_features_1 <- c("age_category", "insurance_category",
+                          "marital_status_category", "gender")
+
+# plots (looped by features)
+readmission_plots <- lapply(categorical_features_1, function(var) {
+  plot_readmission_by_category(cleaned_patient_data, var)
+})
+
+grid.arrange(grobs = readmission_plots, ncol = 2)
+
+f_4_4_6_1_EDA_read_bar <- grid.arrange(grobs = readmission_plots, ncol = 2)
+ggsave("../presentations/figures/f_4_4_6_1_EDA_read_bar.png", plot = f_4_4_6_1_EDA_read_bar, width = 6, height = 4, dpi = 400)
+
+```
+
+```{r eda.4.4.6.2}
+
+# categorical features to visualize
+categorical_features_2 <- c("is_white", "ICU_flag","race_group")
+
+# plots (looped by features)
+readmission_plots2 <- lapply(categorical_features_2, function(var) {
+  plot_readmission_by_category(cleaned_patient_data, var)
+})
+
+grid.arrange(grobs = readmission_plots2, ncol = 2)
+
+f_4_4_6_2_EDA_read_bar <- grid.arrange(grobs = readmission_plots2, ncol = 2)
+ggsave("../presentations/figures/f_4_4_6_2_EDA_read_bar.png", plot = f_4_4_6_2_EDA_read_bar, width = 6, height = 4, dpi = 400)
+
+```
+
+```{r eda.4.4.7}
+
+figure_4_4_7
+ggsave("../presentations/figures/f_4_4_7_readm_patient_cnt.png", plot = figure_4_4_7, width = 6, height = 4, dpi = 400)
+
+```
+
+```{r eda.4.4.8}
+
+target_var <- "readmitted" 
+
+# Continuous / Numerical
+num_plots <- list()
+for (feature in continuous_features) {
+  num_plots[[feature]] <- plot_feature_distribution(data_hosp, feature, target_var)
+  save_named_plot(num_plots[[feature]], paste0("f_4_4_8_num_", feature), width = 5, height = 3, dpi = 300)
+}
+
+# Binary
+binary_plots <- list()
+for (feature in binary_features) {
+  binary_plots[[feature]] <- plot_feature_distribution(data_hosp, feature, target_var)
+  save_named_plot(binary_plots[[feature]], paste0("f_4_4_8_bin_", feature), width = 5, height = 3, dpi = 300)
+}
+
+# Categorical
+cat_plots <- list()
+for (feature in categorical_vars) {
+  cat_plots[[feature]] <- plot_feature_distribution(data_hosp, feature, target_var)
+  save_named_plot(cat_plots[[feature]], paste0("f_4_4_8_cat_", feature), width = 5, height = 3, dpi = 300)
+}
+
+
+```
+
+```{r eda.4.4.9}
+
+target_var <- "hospital_expire_flag" 
+
+# Continuous / Numerical
+num_plots <- list()
+for (feature in continuous_features) {
+  p <- plot_feature_distribution(data_hosp, feature, target_var)
+  num_plots[[feature]] <- p
+  save_named_plot(p, paste0("f_4_4_9_num_", feature))
+}
+
+# Binary
+binary_plots <- list()
+for (feature in binary_features) {
+  p <- plot_feature_distribution(data_hosp, feature, target_var)
+  binary_plots[[feature]] <- p
+  save_named_plot(p, paste0("f_4_4_9_bin_", feature))
+}
+
+# Categorical
+cat_plots <- list()
+for (feature in categorical_vars) {
+  p <- plot_feature_distribution(data_hosp, feature, target_var)
+  cat_plots[[feature]] <- p
+  save_named_plot(p, paste0("f_4_4_9_cat_", feature))
+}
+
+```
+
+```{r eda.4.4.10}
+
+target_var <- "mortality_30_day" 
+
+# Continuous / Numerical Features
+num_plots <- list()
+for (feature in continuous_features) {
+  p <- plot_feature_distribution(data_hosp, feature, target_var)
+  num_plots[[feature]] <- p
+  save_named_plot(p, paste0("f_4_4_10_num_", feature))
+}
+
+# Binary Features
+binary_plots <- list()
+for (feature in binary_features) {
+  p <- plot_feature_distribution(data_hosp, feature, target_var)
+  binary_plots[[feature]] <- p
+  save_named_plot(p, paste0("f_4_4_10_bin_", feature))
+}
+
+# Categorical Features
+cat_plots <- list()
+for (feature in categorical_vars) {
+  p <- plot_feature_distribution(data_hosp, feature, target_var)
+  cat_plots[[feature]] <- p
+  save_named_plot(p, paste0("f_4_4_10_cat_", feature))
+}
+
+```
+
+#### Clear workspace
+```{r rm.1}
+
+rm(list = ls(pattern = "f_4_4"))
+rm(list = ls(pattern = "plots"))
+rm(list = ls(pattern = "_list"))
+rm(list = ls(pattern = "figure_4_4"))
+rm(list = ls(pattern = "readmitted_"))
+rm(list = ls(pattern = "_counts"))
+rm(list = ls(pattern = "patient_"))
+rm(list = ls(pattern = "^p$"))
+rm(list = ls(pattern = "ipums_data"), envir = .GlobalEnv)
+rm(list = ls(pattern = "^data"), envir = .GlobalEnv)
+gc()
+
+```
+
+## Normality and Trasnformaiton
+
+```{r transform.4.5.0}
+
+data_hosp <- load_dataset("data_hosp_100.rds")
+
+normality_results_full <- check_normality_shapiro(
+  data_hosp,
+  continuous_features,
+  sample_size = 500,  # internal sample of 500 is fine
+  remove_zeros = TRUE
+)
+
+non_normal_features <- normality_results_full %>%
+  filter(statistic < 0.9) %>%
+  arrange(statistic) %>%
+  pull(Feature)
+
+saveRDS(non_normal_features, here("data", "metadata", "non_normal_features.rds"))
+
+data_hosp <- log_transform_vars(data_hosp, non_normal_features, suffix = "_log")
+
+# Update feature sets
+transformed_features <- names(data_hosp)[grepl("_log$", names(data_hosp))]
+transformed_base <- gsub("_log$", "", transformed_features)
+intersecting_base <- intersect(continuous_features, transformed_base)
+
+updated_continuous_features <- union(
+  setdiff(continuous_features, intersecting_base),
+  transformed_features
+)
+
+features_sdoh_log           <- replace_features_by_suffix(features_sdoh, names(data_hosp))
+features_no_sdoh_log        <- replace_features_by_suffix(features_no_sdoh, names(data_hosp))
+features_hosp_sdoh_log      <- replace_features_by_suffix(features_hosp_sdoh, names(data_hosp))
+features_hosp_icu_log       <- replace_features_by_suffix(features_hosp_icu, names(data_hosp))
+features_hosp_icu_sdoh_log  <- replace_features_by_suffix(features_hosp_icu_sdoh, names(data_hosp))
+features_non_late_log       <- replace_features_by_suffix(features_non_late, names(data_hosp))
+features_non_late_sdoh_log  <- replace_features_by_suffix(features_non_late_sdoh, names(data_hosp))
+
+# Save
+saveRDS(data_hosp, here("data", "processed", "data_hosp_100_log.rds"))
+saveRDS(updated_continuous_features, here("data", "metadata", "updated_continuous_features.rds"))
+saveRDS(features_sdoh_log, here("data", "metadata", "features_sdoh_log.rds"))
+saveRDS(features_no_sdoh_log, here("data", "metadata", "features_no_sdoh_log.rds"))
+saveRDS(features_non_late_log, here("data", "metadata", "features_non_late_log.rds"))
+saveRDS(features_non_late_sdoh_log, here("data", "metadata", "features_non_late_sdoh_log.rds"))
+
+rm(list = ls(pattern = "^data"), envir = .GlobalEnv)
+gc()
+
+```
+
+```{r transform.4.5.1}
+
+f_4_5_1_shapiro <- render_normality_table(normality_results_full, end = 0.8)
+save_kable(f_4_5_1_shapiro, file = "../presentations/figures/f_4_5_1_shapiro.png")
+
+```
+
+```{r transform.4.5.2}
+
+## Load 10% and transform. Ruun QQ plots (100% to much data)
+data_hosp <- load_dataset("data_hosp_10.rds")
+
+qq_plots <- plot_qq_by_variable(data_hosp, continuous_features)
+
+for (feature in names(qq_plots)) {
+  save_named_plot(qq_plots[[feature]], paste0("f_4_5_2_qq_", feature), width = 4, height = 3, dpi = 300)
+}
+
+data_hosp <- log_transform_vars(data_hosp, non_normal_features, suffix = "_log")
+
+# Save
+saveRDS(data_hosp, here("data", "processed", "data_hosp_10_log.rds"))
+
+# -----------------------------------------------------------------
+
+data_hosp_25 <- load_dataset("data_hosp_25.rds")
+data_hosp_25 <- log_transform_vars(data_hosp_25, non_normal_features, suffix = "_log")
+
+# Save
+saveRDS(data_hosp_25, here("data", "processed", "data_hosp_25_log.rds"))
+
+# -----------------------------------------------------------------
+
+data_hosp_50 <- load_dataset("data_hosp_50.rds")
+data_hosp_50 <- log_transform_vars(data_hosp_50, non_normal_features, suffix = "_log")
+
+# Save
+saveRDS(data_hosp_50, here("data", "processed", "data_hosp_50_log.rds"))
+
+```
+
+```{r transform.4.5.3}
+
+## Load transformed full dataset and render results
+data_hosp_100 <- load_dataset("data_hosp_100_log.rds")
+
+normality_trans_results <- check_normality_shapiro(data_hosp_100, transformed_features, sample_size = 500, remove_zeros = TRUE)
+f_4_5_3_shapiro <- render_normality_table(normality_trans_results, end = 0.8)
+save_kable(f_4_5_3_shapiro, file = "../presentations/figures/f_4_5_3_shapiro.png")
+
+```
+
+```{r transform.4.5.4}
+
+#replot 10% sample after transformation
+qq_plots_2 <- plot_qq_by_variable(data_hosp, transformed_features)
+
+for (feature in names(qq_plots_2)) {
+  save_named_plot(qq_plots_2[[feature]], paste0("f_4_5_4_qq_", feature), width = 4, height = 3, dpi = 300)
+}
+
+```
+
+#### Clear workspace
+
+```{r rm.2}
+
+rm(list = ls(pattern = "f_4_5"))
+rm(list = ls(pattern = "plots"))
+rm(list = ls(pattern = "_list"))
+rm(list = ls(pattern = "results_"))
+rm(list = ls(pattern = "^data"), envir = .GlobalEnv)
+gc()
+
+```
+
+## Statistical Testing LOS
+
+```{r tests.4.6.1.LOS.Parametric}
+
+data_hosp <- load_dataset("data_hosp_25_log.rds")
+
+#LM
+# Collinearity Check
+clean_predictors_los <- setdiff(c(categorical_vars, updated_continuous_features, binary_features), c("is_white"))
+LOS_LM_Model <- run_linear_models(data_hosp, "length_of_stay", clean_predictors_los)
+f_4_6_1_los_lm_vif <- render_vif_summary_table(LOS_LM_Model[["length_of_stay"]], target_name = "length_of_stay")
+save_kable(f_4_6_1_los_lm_vif, file = "../presentations/figures/f_4_6_1_los_lm_vif.png")
+
+```
+
+```{r tests.4.6.2.LOS.Parametric}
+
+# Remove illogical, collinear, data leagae features
+filter_los = c("total_icu_stays_log", "length_of_stay_log","los_icu_log","total_icu_hours_log","is_white", "ICU_flag", "mortality_30_day")
+
+clean_predictors_los_2 <- setdiff(c(categorical_vars, updated_continuous_features, binary_features), filter_los)
+LOS_LM_Model_2 <- run_linear_models(data_hosp, "length_of_stay", clean_predictors_los_2)
+
+f_4_6_2_los_lm <- render_lm_summary_table(LOS_LM_Model_2[["length_of_stay"]], target_name = "length_of_stay", exclude_terms = filter_los, begin= .2, end = 1)
+save_kable(f_4_6_2_los_lm, file = "../presentations/figures/f_4_6_2_los_lm.png")
+
+```
+
+```{r tests.4.6.3.LOS.Parametric}
+
+# ANOVA for categorical features
+f_4_6_3_los_anova <- render_anova_summary_table(data_hosp, 
+                                                target = "length_of_stay", 
+                                                predictors = categorical_vars)
+
+save_kable(f_4_6_3_los_anova, file = "../presentations/figures/f_4_6_3_los_anova.png")
+
+```
+
+```{r tests.4.6.4.LOS.Non-Parametric}
+
+# Loop over binary features and run test vs. LOS
+wilcox_binary_results <- lapply(binary_features, function(bin_var) {
+  run_wilcoxon_tests(
+    data = data_hosp,
+    continuous_vars = "length_of_stay",
+    binary_var = bin_var,
+    target_label = bin_var
+  )
+})
+
+# Combine and render
+wilcox_binary_df <- do.call(rbind, wilcox_binary_results)
+f_4_6_4_los_wilcox <- render_wilcoxon_summary_table(wilcox_binary_df, begin = .2, end = .9)
+save_kable(f_4_6_4_los_wilcox, file = "../presentations/figures/f_4_6_4_los_wilcox.png")
+
+wilcox_ns <- c("wound_debridement_flag", "stroke_prevention_flag", 
+               "shock_management_flag", "neurosurgery_flag")
+
+```
+
+> Wilcox Not significant:	wound_debridement_flag,	stroke_prevention_flag,	shock_management_flag,	neurosurgery_flag
+
+```{r tests.4.6.5.LOS.Non-Parametric}
+
+kruskal_los_df <- run_kruskal_tests(
+  data = data_hosp,
+  numeric_vars = categorical_vars,
+  target_var = "length_of_stay"
+)
+
+f_4_6_5_los_kruskal <- render_wilcoxon_summary_table(kruskal_los_df, title = "Kruskal-Wallis Test: Categorical Features vs LOS")
+save_kable(f_4_6_5_los_kruskal, file = "../presentations/figures/f_4_6_5_los_kruskal.png")
+
+```
+
+```{r tests.4.6.6.LOS.Non-Parametric}
+
+f_4_6_6_los_cor <- plot_correlation_heatmap(data_hosp, updated_continuous_features)
+ggsave("../presentations/figures/f_4_6_6_los_cor.png", plot = f_4_6_6_los_cor, width = 11, height = 10, dpi = 300)
+
+```
+
+```{r tests.4.6.los.summary}
+
+filter_los = c("total_icu_stays_log", "length_of_stay_log","los_icu_log","total_icu_hours_log","is_white","ICU_flag", "mortality_30_day")
+wilcox_ns <- c("wound_debridement_flag", "stroke_prevention_flag", 
+               "shock_management_flag", "neurosurgery_flag")
+features_to_remove_los <- c(filter_los, wilcox_ns)
+saveRDS(features_to_remove_los, here("data", "metadata", "features_to_remove_los.rds"))
+features_no_sdoh_log_los <- setdiff(features_no_sdoh_log, features_to_remove_los)
+features_sdoh_log_los <- setdiff(features_sdoh_log, features_to_remove_los)
+
+```
+
+#### Reviewing the output from the testing we see the features below either show little to no effect, do not fit the anakysis, or represent data leakage and are too predictive. 
+
+---
+
+## Statistical Testing Binary
+> non-transformed continuous features
+
+```{r tests.4.6.7.binary.Parametric}
+
+clean_predictors_binary_1 <- setdiff(c(categorical_vars, continuous_features, binary_features), c("is_white","hospital_expire_flag","mortality_30_day","readmitted"))
+GLM_binary_models <- run_logistic_models(data_hosp, target_vars, clean_predictors_binary_1)
+
+f_4_6_7_readmit_log <- render_vif_summary_table(GLM_binary_models[["readmitted"]], target_name = "readmitted", begin = .4, end = 1)
+f_4_6_7_mort30_log <- render_vif_summary_table(GLM_binary_models[["mortality_30_day"]], target_name = "mortality_30_day", begin = .4, end = 1)
+f_4_6_7_morthosp_log <-render_vif_summary_table(GLM_binary_models[["hospital_expire_flag"]], target_name = "hospital_expire_flag", begin = .4, end = 1)
+
+save_kable(f_4_6_7_readmit_log, file = "../presentations/figures/f_4_6_7_readmit_binary.png")
+save_kable(f_4_6_7_mort30_log, file = "../presentations/figures/f_4_6_7_mort30_binary.png")
+save_kable(f_4_6_7_morthosp_log, file = "../presentations/figures/f_4_6_7_morthosp_binary.png")
+
+```
+
+> Based on high VIF, Drop 1 or 2 of the income features
+
+```{r tests.4.6.8.binary.Parametric}
+
+# Remove illogical, collinear, data leagae features
+filter_binary_1 = c("weighted_income","weighted_inc_welfare") # , "weighted_inc_welfare"
+
+clean_predictors_binary_2 <- setdiff(clean_predictors_binary_1, filter_binary_1)
+GLM_binary_models_2 <- run_logistic_models(data_hosp, target_vars, clean_predictors_binary_2)
+
+f_4_6_8_read_log <- render_logit_summary_table(GLM_binary_models_2[["readmitted"]], target_name = "readmitted", exclude_terms = filter_binary_1, rank_by = "p.value", begin = .3, end = 1) # p_filter = .05
+f_4_6_8_mort30_log <- render_logit_summary_table(GLM_binary_models_2[["mortality_30_day"]], target_name = "mortality_30_day", exclude_terms = filter_binary_1, rank_by = "p.value", begin = .3, end = 1) # p_filter = .05
+f_4_6_8_morthosp_log <- render_logit_summary_table(GLM_binary_models_2[["hospital_expire_flag"]], target_name = "hospital_expire_flag", exclude_terms = filter_binary_1, rank_by = "p.value", begin = .3, end = 1) # p_filter = .05
+
+save_kable(f_4_6_8_read_log, file = "../presentations/figures/f_4_6_8_read_binary.png")
+save_kable(f_4_6_8_mort30_log, file = "../presentations/figures/f_4_6_8_mort30_binary.png")
+save_kable(f_4_6_8_morthosp_log, file = "../presentations/figures/f_4_6_8_morthosp_binary.png")
+
+```
+
+> Reviewing the T stat and odd ratio
+
+#### Bases on the Z-stat and odds ratio we can see features that are heavily influencing the the model which shuold not be included:
+> discharge_location_categoryDIED, discharge_location_categoryHOSPICE. This makes sence as they are highly related, or wholy inclusive or exclusive of the targets, so we will remove the whole feature.
+
+```{r tests.4.6.9.binary.Parametric}
+
+filter_binary_2 = c("weighted_income", "weighted_inc_welfare","discharge_location_categoryDIED", "discharge_location_categoryHOSPICE")
+
+f_4_6_9_read_glm <- render_logit_summary_table(GLM_binary_models_2[["readmitted"]], target_name = "Readmitted", exclude_terms = filter_binary_2, rank_by = "p.value", begin = .3, end = 1) # p_filter = .05
+f_4_6_9_mort30_glm <- render_logit_summary_table(GLM_binary_models_2[["mortality_30_day"]], target_name = "mortality_30_day", exclude_terms = filter_binary_2, rank_by = "p.value", begin = .3, end = 1) # p_filter = .05
+f_4_6_9_morthosp_glm <- render_logit_summary_table(GLM_binary_models_2[["hospital_expire_flag"]], target_name = "hospital_expire_flag", exclude_terms = filter_binary_2, rank_by = "p.value", begin = .3, end = 1) # p_filter = .05
+
+
+save_kable(f_4_6_9_read_glm, file = "../presentations/figures/f_4_6_9_read_glm.png")
+save_kable(f_4_6_9_mort30_glm, file = "../presentations/figures/f_4_6_9_mort30_glm.png")
+save_kable(f_4_6_9_morthosp_glm, file = "../presentations/figures/f_4_6_9_morthosp_glm.png")
+
+```
+#### The final list looks suitable to include for feature selection
+
+```{r tests.4.6.10.binary.Non-Parametric}
+
+# Run tests
+wilcox_readmit_df <- run_wilcoxon_tests(
+  data = data_hosp,
+  continuous_vars = continuous_features,
+  binary_var = "readmitted",
+  target_label = "Readmission"
+)
+
+wilcox_mortality_df <- run_wilcoxon_tests(
+  data = data_hosp,
+  continuous_vars = continuous_features,
+  binary_var = "mortality_30_day",
+  target_label = "30-Day Mortality"
+)
+
+wilcox_hosp_mort_df <- run_wilcoxon_tests(
+  data = data_hosp,
+  continuous_vars = continuous_features,
+  binary_var = "hospital_expire_flag",
+  target_label = "Hospital Mortality"
+)
+
+# Render results
+f_4_6_10_read_wilcox <- render_wilcoxon_summary_table(wilcox_readmit_df, title = "Wilcoxon Test: Readmission",begin = .3, end = 1)
+f_4_6_10_mort30_wilcox <- render_wilcoxon_summary_table(wilcox_mortality_df, title = "Wilcoxon Test: 30-Day Mortality",begin = .3, end = 1)
+f_4_6_10_morthosp_wilcox <- render_wilcoxon_summary_table(wilcox_hosp_mort_df, title = "Wilcoxon Test: Hospital Mortality",begin = .3, end = 1)
+
+
+save_kable(f_4_6_10_read_wilcox, file = "../presentations/figures/f_4_6_10_read_wilcox.png")
+save_kable(f_4_6_10_mort30_wilcox, file = "../presentations/figures/f_4_6_10_mort30_wilcox.png")
+save_kable(f_4_6_10_morthosp_wilcox, file = "../presentations/figures/f_4_6_10_morthosp_wilcox.png")
+
+```
+
+#### all feautres we significant for 30-Day mort and Readmission, and "prior_hospital_visits_1yr" (.9285) was not for in hospital mortality
+> we will remove these given the high p stat
+
+```{r tests.4.6.11.binary.Non-Parametric}
+
+all_chisq_results_1 <- run_chisq_for_targets(data_hosp, c("readmitted", "mortality_30_day","hospital_expire_flag"))
+all_chisq_results_clean <- all_chisq_results_1 %>% filter(!is.na(P_Value))
+f_4_6_11_a_chisq <- render_chisq_summary_table(all_chisq_results_clean, begin = 0.4, end = 1, title = "Chi-Squared Results: All Binary Targets")
+
+save_kable(f_4_6_11_a_chisq, file = "../presentations/figures/f_4_6_11_a_chisq.png")
+
+filter_cat = c("mortality_30_day","discharge_location_category")
+clean_cat <- setdiff(categorical_vars, filter_cat)
+
+all_chisq_results_2 <- run_chisq_for_targets(data = data_hosp, target_var = c( "readmitted", "mortality_30_day","hospital_expire_flag"), cat_vars = clean_cat)
+all_chisq_results_clean_2 <- all_chisq_results_2 %>% filter(!is.na(P_Value))
+f_4_6_11_b_chisq <- render_chisq_summary_table(all_chisq_results_clean_2, begin = 0.4, end = 1, title = "Chi-Squared Results: All Binary Targets")
+
+save_kable(f_4_6_11_b_chisq, file = "../presentations/figures/f_4_6_11_b_chisq.png")
+
+```
+
+#### for Mortality targets discharge location is too significant and represents some data leakage in the case of "DIED" "HOSPICE" and for the entire Hopsital MORT target. This feature may be rmeoived entiredly or kept in part.
+
+```{r tests.4.6.12.binary.Non-Parametric}
+
+clean_features_binary <- setdiff((binary_features), c("hospital_expire_flag","mortality_30_day","readmitted"))
+fishers_df_read <- run_fishers_tests(data = data_hosp, binary_var = clean_features_binary, target_var = "readmitted", target_label = "Readmitted") 
+fishers_df_30mort <- run_fishers_tests(data = data_hosp, binary_var = clean_features_binary, target_var = "mortality_30_day", target_label = "mortality_30_day") 
+fishers_df_hospmort <- run_fishers_tests(data = data_hosp, binary_var = clean_features_binary, target_var = "hospital_expire_flag", target_label = "hospital_expire_flag") 
+
+f_4_6_12_readmit_fishers <- render_fisher_summary_table(fishers_df_read, begin = .4, end = 1)
+f_4_6_12_30mort_fishers <- render_fisher_summary_table(fishers_df_30mort, begin = .4, end = 1)
+f_4_6_12_hospmort_fishers <- render_fisher_summary_table(fishers_df_hospmort, begin = .4, end = 1)
+
+save_kable(f_4_6_12_readmit_fishers, file = "../presentations/figures/f_4_6_12_readmit_fishers.png")    
+save_kable(f_4_6_12_30mort_fishers, file = "../presentations/figures/f_4_6_12_30mort_fishers.png")    
+save_kable(f_4_6_12_hospmort_fishers, file = "../presentations/figures/f_4_6_12_hospmort_fishers.png")    
+
+```
+
+### Late stage features such as ecmo, cpr, prolonged ventilation, Pressor Meds all may be too late to be supportive in terms of intervention, but in the context of CMS retrospective analysis, hospital quality models, and outcome interpretation that could be useful, espcially to evalute clusters on final models. Given that we will keep them fpor now but perhaps train a second model type that removed the "late stage" features that could represent data leakage or be too late to be useful in realtime.
+
+> In-hospital CPR survival rates are low (~15-25%), often occures minuntws before death
+> ECMO is used in extreme cases of cardiac or respiratory failure, usually hours to days before before end of life
+> Pressor Meds are used to maintain blood pressure in shock (e.g., sepsis, cardiac), and can increase ovedr time especially during severe instability
+> Prolonged ventilation is only known after 96h, so cannot be used as any early indicator
+
+```{r tests.4.6.binary.summary}
+
+filter_h_mort = c("mortality_30_day", "hospital_expire_flag", "discharge_location_category", "readmitted", "prior_hospital_visits_1yr")
+filter_30_mort = c("mortality_30_day", "hospital_expire_flag", "discharge_location_category", "readmitted")
+filter_readmit = c("mortality_30_day", "hospital_expire_flag", "discharge_location_category", "readmitted")
+
+features_no_sdoh_log                <- readRDS(here("data", "metadata", "features_no_sdoh_log.rds"))
+features_sdoh_log                   <- readRDS(here("data", "metadata", "features_sdoh_log.rds"))
+
+features_no_sdoh_log_h_mort         <- setdiff(features_no_sdoh_log, filter_h_mort)
+features_sdoh_log_h_mort            <- setdiff(features_sdoh_log, filter_h_mort)
+saveRDS(features_no_sdoh_log_h_mort, here("data", "metadata", "features_no_sdoh_log_h_mort.rds"))
+saveRDS(features_sdoh_log_h_mort, here("data", "metadata", "features_sdoh_log_h_mort.rds"))
+
+features_no_sdoh_log_30_mort        <- setdiff(features_no_sdoh_log, filter_30_mort)
+features_sdoh_log_30_mort           <- setdiff(features_sdoh_log, filter_30_mort)
+saveRDS(features_no_sdoh_log_30_mort, here("data", "metadata", "features_no_sdoh_log_30_mort.rds"))
+saveRDS(features_sdoh_log_30_mort, here("data", "metadata", "features_sdoh_log_30_mort.rds"))
+
+features_no_sdoh_log_readmit        <- setdiff(features_no_sdoh_log, filter_readmit)
+features_sdoh_log_readmit           <- setdiff(features_sdoh_log, filter_readmit)
+saveRDS(features_no_sdoh_log_readmit, here("data", "metadata", "features_no_sdoh_log_readmit.rds"))
+saveRDS(features_sdoh_log_readmit, here("data", "metadata", "features_sdoh_log_readmit.rds"))
+
+```
+
+---
+
+#### Clear workspace
+
+```{r rm.3}
+
+rm(list = ls(pattern = "f_4_6"))
+rm(list = ls(pattern = "plots"))
+rm(list = ls(pattern = "_list"))
+rm(list = ls(pattern = "fishers"))
+rm(list = ls(pattern = "wilcox"))
+rm(list = ls(pattern = "chisq"))
+rm(list = ls(pattern = "LM_Model"))
+rm(list = ls(pattern = "binary_model"))
+rm(list = ls(pattern = "^data"), envir = .GlobalEnv)
+gc()
+
+```
+
+### Model Training & Feature Selection - Continuous
+
+```{r feat.sel.4.7.0.los}
+
+# Load Featurte Sets
+source(here("scripts", "feature_sets.R"))
+# Load utilities
+source(here("scripts", "utils.R"))
+
+# Load 10% Data Sample for EDA
+data_hosp <- load_dataset("data_hosp_10_log.rds")
+# Load Functions
+source(here("scripts", "figs_funcs.R"))
+
+features_sdoh_log           <- readRDS(here("data", "metadata", "features_sdoh_log.rds"))
+features_no_sdoh_log        <- readRDS(here("data", "metadata", "features_no_sdoh_log.rds"))
+features_non_late_log       <- readRDS(here("data", "metadata", "features_non_late_log.rds"))
+features_non_late_sdoh_log  <- readRDS(here("data", "metadata", "features_non_late_sdoh_log.rds"))
+
+features_to_remove_los <- readRDS(here("data", "metadata", "features_to_remove_los.rds"))
+features_no_sdoh_log_los <- setdiff(features_no_sdoh_log, features_to_remove_los)
+features_sdoh_log_los <- setdiff(features_sdoh_log, features_to_remove_los)
+
+
+```
+
+```{r feat.sel.4.7.los.inputs}
+
+data_hosp <- load_dataset("data_hosp_10_log.rds")
+### "mortality_30_day", "readmitted", "hospital_expire_flag", "length_of_stay"
+
+set.seed(42)
+train_function = "train_single_model2"
+data <- data_hosp
+dataset_name <- "Samp_10"
+target <- "length_of_stay"
+file_name <- "los_10_feat_sel"
+slices <- 4
+model_run <- "los_10_feat_sel"
+split_type <- "patient"
+train_size <- 0.7
+cv_splits <- 4
+final_model <- FALSE
+
+```
+
+```{r feat.sel.4.7.los.train}
+
+set.seed(42)
+
+##############################
+### Logistic Regression
+##############################
+
+train_and_assign(
+  model_type = "glm",
+  feature_set_name = "Base_SDOH",
+  selected_features = features_sdoh_log_los,
+  tuneGrid = NULL
+)
+
+train_and_assign(
+  model_type = "glm",
+  feature_set_name = "Base",
+  selected_features = features_no_sdoh_log_los,
+  tuneGrid = NULL
+)
+
+##############################
+### GLMNet (Ridge, Lasso, Elastic Net)
+##############################
+
+tuneGrid_glmnet <- expand.grid(
+  alpha =  1,  # Ridge = 0, Elastic = 0.5, Lasso = 1
+  lambda = 0.1
+  )
+
+train_and_assign(
+  model_type = "glmnet",
+  feature_set_name = "Base_SDOH",
+  selected_features = features_sdoh_log_los,
+  tuneGrid = tuneGrid_glmnet
+)
+
+train_and_assign(
+  model_type = "glmnet",
+  feature_set_name = "Base",
+  selected_features = features_no_sdoh_log_los,
+  tuneGrid = tuneGrid_glmnet
+)
+
+##############################
+### Bayesian Logistic Regression
+##############################
+
+train_and_assign(
+  model_type = "bayesglm",
+  feature_set_name = "Base_SDOH",
+  selected_features = features_sdoh_log_los,
+  tuneGrid = NULL
+)
+
+train_and_assign(
+  model_type = "bayesglm",
+  feature_set_name = "Base",
+  selected_features = features_no_sdoh_log_los,
+  tuneGrid = NULL
+)
+
+##############################
+### Gradient Boosted Trees (XGBoost)
+##############################
+
+tuneGrid_xgb <- expand.grid(
+  nrounds = 200,
+  max_depth = 6,
+  eta = 0.3,
+  gamma = 0,
+  colsample_bytree = 1,
+  min_child_weight = 1,
+  subsample = 1
+)
+
+train_and_assign(
+  model_type = "xgbTree",
+  feature_set_name = "Base_SDOH",
+  selected_features = features_sdoh_log_los,
+  tuneGrid = tuneGrid_xgb
+)
+
+train_and_assign(
+  model_type = "xgbTree",
+  feature_set_name = "Base",
+  selected_features = features_no_sdoh_log_los,
+  tuneGrid = tuneGrid_xgb
+)
+
+##############################
+### Gradient Boosting Machines (GBM)
+##############################
+
+tuneGrid_gbm <- expand.grid(
+  interaction.depth = 3,
+  n.trees = 100,
+  shrinkage = 0.1,
+  n.minobsinnode = 10
+)
+
+train_and_assign(
+  model_type = "gbm",
+  feature_set_name = "Base_SDOH",
+  selected_features = features_sdoh_log_los,
+  tuneGrid = tuneGrid_gbm
+)
+
+train_and_assign(
+  model_type = "gbm",
+  feature_set_name = "Base",
+  selected_features = features_no_sdoh_log_los,
+  tuneGrid = tuneGrid_gbm
+)
+
+##############################
+### Random Forest
+##############################
+
+tuneGrid_rf <- expand.grid(mtry = 2)
+
+train_and_assign(
+  model_type = "rf",
+  feature_set_name = "Base_SDOH",
+  selected_features = features_sdoh_log_los,
+  tuneGrid = tuneGrid_rf
+)
+
+train_and_assign(
+  model_type = "rf",
+  feature_set_name = "Base",
+  selected_features = features_no_sdoh_log_los,
+  tuneGrid = tuneGrid_rf
+)
+
+##############################
+### Final Model Verification
+##############################
+
+# print(ls(pattern = model_run))
+
+```
+
+```{r feat.sel.4.7.los.save}
+
+matching_models_los_fs <- mget(
+  ls(pattern = model_run, envir = .GlobalEnv),
+  envir = .GlobalEnv
+)
+
+save_models(matching_models_los_fs, subfolder = "length_of_stay_10")
+
+```
+
+```{r feat.sel.4.7.los}
+
+# matching_models_los_fs <- mget(
+#   ls(pattern = "^gbm", envir = .GlobalEnv),
+#   envir = .GlobalEnv
+# )
+
+feature_selection_results_los <- list()
+
+for (model_name in names(matching_models_los_fs)) {
+  model_obj <- matching_models_los_fs[[model_name]]
+  model_type <- model_obj$method
+  
+  message("Feature selection for model: ", model_name)
+  
+  model_input <- get_model_data_and_features(model_obj, target = "length_of_stay")
+
+selected_feats <- feature_selection(
+  model = model_obj,
+  target = "length_of_stay",
+  features = model_input$features,
+  dataset = model_input$data,
+  return_stats = TRUE
+)
+  
+  if ("Overall" %in% colnames(selected_feats)) {
+    selected_names <- selected_feats$feature[selected_feats$Overall > 0]
+  } else {
+    selected_names <- selected_feats$feature
+  }
+  removed_feats <- setdiff(model_input$features, selected_names)
+
+  # results
+  feature_selection_results_los[[model_name]] <- list(
+    selected = selected_feats,
+    removed = removed_feats
+  )
+  
+  saveRDS(
+  feature_selection_results_los,
+  here::here("data", "metadata", "feature_selection_results_los.rds")
+  )
+  
+}
+
+```
+
+```{r feat.sel.4.7.los.review}
+
+feature_selection_results_los <- readRDS(here::here("data", "metadata", "feature_selection_results_los.rds"))
+
+# Get all unique removed features across all models
+all_removed <- unique(unlist(lapply(feature_selection_results_los, function(x) x$removed)))
+
+# Create a matrix: rows = features, cols = models
+removed_matrix <- sapply(names(feature_selection_results_los), function(model_name) {
+  removed <- feature_selection_results_los[[model_name]]$removed
+  all_removed %in% removed
+})
+
+# Convert to data frame
+removed_df <- as.data.frame(removed_matrix)
+rownames(removed_df) <- all_removed
+
+removed_df_pretty <- removed_df
+removed_df_pretty[] <- lapply(removed_df_pretty, function(col) ifelse(col, "X", "-"))
+
+t_4_7_1_removed_los <- removed_df_pretty
+write.csv(t_4_7_1_removed_los, file = "../presentations/figures/t_4_7_1_removed_los.csv", row.names = TRUE, fileEncoding = "UTF-8")
+
+```
+
+```{r feat.sel.4.7.los.cleanup}
+
+rm(list = ls(pattern = "los_10_feat_sel"), envir = .GlobalEnv)
+gc()
+
+```
+
+### Final Model Training and Tuning - Length of Stay
+
+```{r tunning.4.7.los.inputs}
+
+# Load Featurte Sets
+source(here("scripts", "feature_sets.R"))
+# Load utilities
+source(here("scripts", "utils.R"))
+
+# Load 20% Data Sample for tuning
+data_hosp <- load_dataset("data_hosp_25_log.rds")
+
+source(here("scripts", "figs_funcs.R"))
+
+features_sdoh_log           <- readRDS(here("data", "metadata", "features_sdoh_log.rds"))
+features_no_sdoh_log        <- readRDS(here("data", "metadata", "features_no_sdoh_log.rds"))
+features_non_late_log       <- readRDS(here("data", "metadata", "features_non_late_log.rds"))
+features_non_late_sdoh_log  <- readRDS(here("data", "metadata", "features_non_late_sdoh_log.rds"))
+
+features_to_remove_los <- readRDS(here("data", "metadata", "features_to_remove_los.rds"))
+features_no_sdoh_log_los <- setdiff(features_no_sdoh_log, features_to_remove_los)
+features_sdoh_log_los <- setdiff(features_sdoh_log, features_to_remove_los)
+
+feature_selection_results_los <- readRDS(here("data", "metadata", "feature_selection_results_los.rds"))
+
+set.seed(42)
+train_function = "train_single_model2"
+data <- data_hosp
+dataset_name <- "Samp_25"
+target <- "length_of_stay"
+file_name <- "los_25_tuning.csv"
+slices <- 4
+model_run <- "los_25_tuning"
+split_type <- "patient"
+train_size <- 0.7
+cv_splits <- 4
+final_model <- FALSE
+
+```
+
+```{r tunning.4.7.los.train}
+
+##############################
+### Tunning Grids
+##############################
+
+# XGBoost
+tuneGrid_xgb <- expand.grid(
+  nrounds = c(100, 200),
+  max_depth = c(3, 6, 9),
+  eta = c(0.01, 0.1, 0.3),
+  gamma = 0,
+  colsample_bytree = 1,
+  min_child_weight = 1,
+  subsample = 1
+)
+
+# GBM
+tuneGrid_gbm <- expand.grid(
+  interaction.depth = c(1, 3, 5),
+  n.trees = c(50, 100),
+  shrinkage = c(0.05, 0.1),
+  n.minobsinnode = c(5, 10)
+)
+
+# Random Forest
+tuneGrid_rf <- expand.grid(
+  mtry = c(10) # mtry = c(2, 4, 6, 8)
+)
+
+set.seed(42)
+
+##############################
+### XGBoost (Gradient Boosted Trees)
+##############################
+
+nrounds = 200; max_depth = 6; eta = 0.1; gamma = 0; colsample_bytree = 1; min_child_weight = 1; subsample = 1
+train_and_assign(
+  model_type = "xgbTree",
+  feature_set_name = "Base_SDOH",
+  selected_features = get_training_ready_features(
+    "xgbTree", "base_sdoh", "length_of_stay", "los_10_feat_sel", feature_selection_results_los, features_sdoh_log_los),
+  tuneGrid = tuneGrid_xgb
+)
+
+train_and_assign(
+  model_type = "xgbTree",
+  feature_set_name = "Base",
+  selected_features = get_training_ready_features(
+    "xgbTree", "base", "length_of_stay", "los_10_feat_sel", feature_selection_results_los, features_no_sdoh_log_los),
+  tuneGrid = tuneGrid_xgb
+)
+
+##############################
+### GBM (Gradient Boosting Machines)
+##############################
+
+interaction.depth = 5; n.trees = 100; shrinkage = 0.1; n.minobsinnode = 5
+train_and_assign(
+  model_type = "gbm",
+  feature_set_name = "Base_SDOH",
+  selected_features = get_training_ready_features(
+    "gbm", "base_sdoh", "length_of_stay", "los_10_feat_sel", feature_selection_results_los, features_sdoh_log_los),
+  tuneGrid = tuneGrid_gbm
+)
+
+train_and_assign(
+  model_type = "gbm",
+  feature_set_name = "Base",
+  selected_features = get_training_ready_features(
+    "gbm", "base", "length_of_stay", "los_10_feat_sel", feature_selection_results_los, features_no_sdoh_log_los),
+  tuneGrid = tuneGrid_gbm
+)
+
+##############################
+### Random Forest
+##############################
+
+
+train_and_assign(
+  model_type = "rf",
+  feature_set_name = "Base_SDOH",
+  selected_features = get_training_ready_features(
+    "rf", "base_sdoh", "length_of_stay", "los_10_feat_sel", feature_selection_results_los, features_sdoh_log_los),
+  tuneGrid = tuneGrid_rf
+)
+
+train_and_assign(
+  model_type = "rf",
+  feature_set_name = "Base",
+  selected_features = get_training_ready_features(
+    "rf", "base", "length_of_stay", "los_10_feat_sel", feature_selection_results_los, features_no_sdoh_log_los),
+  tuneGrid = tuneGrid_rf
+)
+
+```
+
+```{r tunning.4.7.los.save}
+
+matching_models_los_fs <- mget(
+  ls(pattern = model_run, envir = .GlobalEnv),
+  envir = .GlobalEnv
+)
+
+save_models(matching_models_los_fs, subfolder = "length_of_stay_25")
+
+rm(list = ls(pattern = "los_25"))
+gc()
+
+```
+
+```{r Final.4.7.1.los.inputs}
+
+### "mortality_30_day", "readmitted", "hospital_expire_flag", "length_of_stay"
+
+# Load Featurte Sets
+source(here("scripts", "feature_sets.R"))
+# Load utilities
+source(here("scripts", "utils.R"))
+
+# Load 100% Data  for Finak Model
+data_hosp <- load_dataset("data_hosp_50_log.rds")
+
+source(here("scripts", "figs_funcs.R"))
+
+features_sdoh_log           <- readRDS(here("data", "metadata", "features_sdoh_log.rds"))
+features_no_sdoh_log        <- readRDS(here("data", "metadata", "features_no_sdoh_log.rds"))
+features_non_late_log       <- readRDS(here("data", "metadata", "features_non_late_log.rds"))
+features_non_late_sdoh_log  <- readRDS(here("data", "metadata", "features_non_late_sdoh_log.rds"))
+
+features_to_remove_los <- readRDS(here("data", "metadata", "features_to_remove_los.rds"))
+features_no_sdoh_log_los <- setdiff(features_no_sdoh_log, features_to_remove_los)
+features_sdoh_log_los <- setdiff(features_sdoh_log, features_to_remove_los)
+
+feature_selection_results_los <- readRDS(here("data", "metadata", "feature_selection_results_los.rds"))
+
+set.seed(42)
+train_function = "train_single_model2"
+data <- data_hosp
+dataset_name <- "Final_100"
+target <- "length_of_stay"
+file_name <- "los_100_final.csv"
+slices <- 1
+model_run <- "los_100_final"
+split_type <- "patient"
+train_size <- 0.7
+cv_splits <- 1
+final_model <- TRUE
+
+```
+
+```{r Final.4.7.1.los.train}
+
+# ##################################
+# ###        XGBoost             ###
+# ##################################
+# 
+# best_grid_xgb <- expand.grid(
+#   nrounds = 200,
+#   max_depth = 6,
+#   eta = 0.1,
+#   gamma = 0,
+#   colsample_bytree = 1,
+#   min_child_weight = 1,
+#   subsample = 1
+# )
+# 
+# train_and_assign(
+#   model_type = "xgbTree",
+#   feature_set_name = "Base_SDOH",
+#   selected_features = get_training_ready_features("xgbTree", "base_sdoh", "length_of_stay", "los_10_feat_sel", feature_selection_results_los, features_sdoh_log_los),
+#   tuneGrid = best_grid_xgb,
+#   final = TRUE
+# )
+# 
+# train_and_assign(
+#   model_type = "xgbTree",
+#   feature_set_name = "Base",
+#   selected_features = get_training_ready_features("xgbTree", "base", "length_of_stay", "los_10_feat_sel", feature_selection_results_los, features_no_sdoh_log_los),
+#   tuneGrid = best_grid_xgb,
+#   final = TRUE
+# )
+# 
+# ##################################
+# ###        GBM                 ###
+# ##################################
+# 
+# best_grid_gbm <- expand.grid(
+#   interaction.depth = 5,
+#   n.trees = 100,
+#   shrinkage = 0.1,
+#   n.minobsinnode = 5
+# )
+# 
+# train_and_assign(
+#   model_type = "gbm",
+#   feature_set_name = "Base_SDOH",
+#   selected_features = get_training_ready_features("gbm", "base_sdoh", "length_of_stay", "los_10_feat_sel", feature_selection_results_los, features_sdoh_log_los),
+#   tuneGrid = best_grid_gbm,
+#   final = TRUE
+# )
+# 
+# train_and_assign(
+#   model_type = "gbm",
+#   feature_set_name = "Base",
+#   selected_features = get_training_ready_features("gbm", "base", "length_of_stay", "los_10_feat_sel", feature_selection_results_los, features_no_sdoh_log_los),
+#   tuneGrid = best_grid_gbm,
+#   final = TRUE
+# )
+
+##################################
+###      Random Forest         ###
+##################################
+
+
+# Random Forest
+tuneGrid_rf <- expand.grid(
+  mtry = c(6) # mtry = c(2, 4, 6, 8)
+)
+
+# train_and_assign(
+#   model_type = "rf",
+#   feature_set_name = "Base_SDOH",
+#   selected_features = get_training_ready_features("rf", "base_sdoh", "length_of_stay", "los_10_feat_sel", feature_selection_results_los, features_sdoh_log_los),
+#   tuneGrid = tuneGrid_rf,
+#   final = TRUE
+# )
+
+train_and_assign(
+  model_type = "rf",
+  feature_set_name = "Base",
+  selected_features = get_training_ready_features("rf", "base", "length_of_stay", "los_10_feat_sel", feature_selection_results_los, features_no_sdoh_log_los),
+  tuneGrid = tuneGrid_rf,
+  final = TRUE
+)
+
+```
+
+```{r final.4.7.los.save}
+
+matching_models_los_fs <- mget(
+  ls(pattern = model_run, envir = .GlobalEnv),
+  envir = .GlobalEnv
+)
+
+save_models(matching_models_los_fs, subfolder = "length_of_stay_final")
+
+rm(list = ls(pattern = model_run), envir = .GlobalEnv)
+gc()
+
+```
+
+```{r final.4.7.los.load}
+
+load_models("models/length_of_stay_final")
+
+```
+
+
+### Model Training & Feature Selection - Mort 30
+
+```{r feat.sel.4.7.0.binary}
+
+# Load Featurte Sets
+source(here("scripts", "feature_sets.R"))
+# Load utilities
+source(here("scripts", "utils.R"))
+
+# Load 10% Data Sample for EDA
+data_hosp <- load_dataset("data_hosp_10_log.rds")
+# Load Functions
+source(here("scripts", "figs_funcs.R"))
+
+features_no_sdoh_log_h_mort         <- readRDS(here("data", "metadata", "features_no_sdoh_log_h_mort.rds"))
+features_sdoh_log_h_mort            <- readRDS(here("data", "metadata", "features_sdoh_log_h_mort.rds"))
+features_no_sdoh_log_30_mort        <- readRDS(here("data", "metadata", "features_no_sdoh_log_30_mort.rds"))
+features_sdoh_log_30_mort           <- readRDS(here("data", "metadata", "features_sdoh_log_30_mort.rds"))
+features_no_sdoh_log_readmit        <- readRDS(here("data", "metadata", "features_no_sdoh_log_readmit.rds"))
+features_sdoh_log_readmit           <- readRDS(here("data", "metadata", "features_sdoh_log_readmit.rds"))
+
+```
+
+```{r feat.sel.4.7.mort30.inputs}
+
+### "mortality_30_day", "readmitted", "hospital_expire_flag", "length_of_stay"
+data_hosp <- load_dataset("data_hosp_10_log.rds")
+
+set.seed(42)
+train_function = "train_single_model2"
+data <- data_hosp
+dataset_name <- "Samp_10"
+target <- "mortality_30_day"
+file_name <- "mort30_feat_sel.csv"
+slices <- 4
+model_run <- "mort30_feat_sel"
+split_type <- "patient"
+train_size <- 0.7
+cv_splits <- 4
+final_model <- FALSE
+
+```
+
+```{r feat.sel.4.7.mort30.train}
+
+set.seed(42)
+
+# === Feature Sets
+base_feats  <- features_no_sdoh_log_30_mort
+sdoh_feats  <- features_sdoh_log_30_mort
+
+###########################
+#### XGBoost
+###########################
+
+tuneGrid_xgb <- expand.grid(
+  nrounds = 200,
+  max_depth = 6,
+  eta = 0.3,
+  gamma = 0,
+  colsample_bytree = 1,
+  min_child_weight = 1,
+  subsample = 1
+)
+
+train_and_assign(model_type = "xgbTree", feature_set_name = "Base", selected_features = base_feats, tuneGrid = tuneGrid_xgb)
+save_models(mget(ls(pattern = "^xgbTree_"), inherits = TRUE), "30_mort_10", clear = TRUE)
+
+train_and_assign(model_type = "xgbTree", feature_set_name = "Base_SDOH", selected_features = sdoh_feats, tuneGrid = tuneGrid_xgb)
+save_models(mget(ls(pattern = "^xgbTree_"), inherits = TRUE), "30_mort_10", clear = TRUE)
+
+###########################
+#### GBM
+###########################
+
+tuneGrid_gbm <- expand.grid(
+  interaction.depth = 3,
+  n.trees = 100,
+  shrinkage = 0.1,
+  n.minobsinnode = 10
+)
+
+train_and_assign(model_type = "gbm", feature_set_name = "Base", selected_features = base_feats, tuneGrid = tuneGrid_gbm)
+save_models(mget(ls(pattern = "^gbm_"), inherits = TRUE), "30_mort_10", clear = TRUE)
+
+train_and_assign(model_type = "gbm", feature_set_name = "Base_SDOH", selected_features = sdoh_feats, tuneGrid = tuneGrid_gbm)
+save_models(mget(ls(pattern = "^gbm_"), inherits = TRUE), "30_mort_10", clear = TRUE)
+
+###########################
+#### Random Forest
+###########################
+
+tuneGrid_rf <- expand.grid(mtry = 2)
+
+train_and_assign(model_type = "rf", feature_set_name = "Base", selected_features = base_feats, tuneGrid = tuneGrid_rf)
+save_models(mget(ls(pattern = "^rf_"), inherits = TRUE), "30_mort_10", clear = TRUE)
+
+train_and_assign(model_type = "rf", feature_set_name = "Base_SDOH", selected_features = sdoh_feats, tuneGrid = tuneGrid_rf)
+save_models(mget(ls(pattern = "^rf_"), inherits = TRUE), "30_mort_10", clear = TRUE)
+
+###########################
+#### Neural Network
+###########################
+
+tuneGrid_nnet <- expand.grid(size = 5, decay = 0.1)
+
+train_and_assign(model_type = "nnet", feature_set_name = "Base", selected_features = base_feats, tuneGrid = tuneGrid_nnet)
+save_models(mget(ls(pattern = "^nnet_"), inherits = TRUE), "30_mort_10", clear = TRUE)
+
+train_and_assign(model_type = "nnet", feature_set_name = "Base_SDOH", selected_features = sdoh_feats, tuneGrid = tuneGrid_nnet)
+save_models(mget(ls(pattern = "^nnet_"), inherits = TRUE), "30_mort_10", clear = TRUE)
+
+###########################
+#### Logistic Regression
+###########################
+
+train_and_assign(model_type = "glm", feature_set_name = "Base", selected_features = base_feats, tuneGrid = NULL)
+save_models(mget(ls(pattern = "^glm_"), inherits = TRUE), "30_mort_10", clear = TRUE)
+
+train_and_assign(model_type = "glm", feature_set_name = "Base_SDOH", selected_features = sdoh_feats, tuneGrid = NULL)
+save_models(mget(ls(pattern = "^glm_"), inherits = TRUE), "30_mort_10", clear = TRUE)
+
+###########################
+#### GLMNet (Ridge, Lasso, Elastic Net)
+###########################
+
+tuneGrid_glmnet <- expand.grid(
+  alpha = .5,
+  lambda = 0.1
+)
+
+train_and_assign(model_type = "glmnet", feature_set_name = "Base", selected_features = base_feats, tuneGrid = tuneGrid_glmnet)
+save_models(mget(ls(pattern = "^glmnet_"), inherits = TRUE), "30_mort_10", clear = TRUE)
+
+train_and_assign(model_type = "glmnet", feature_set_name = "Base_SDOH", selected_features = sdoh_feats, tuneGrid = tuneGrid_glmnet)
+save_models(mget(ls(pattern = "^glmnet_"), inherits = TRUE), "30_mort_10", clear = TRUE)
+
+###########################
+#### Bayesian Logistic Regression
+###########################
+
+train_and_assign(model_type = "bayesglm", feature_set_name = "Base", selected_features = base_feats, tuneGrid = NULL)
+save_models(mget(ls(pattern = "^bayesglm_"), inherits = TRUE), "30_mort_10", clear = TRUE)
+
+train_and_assign(model_type = "bayesglm", feature_set_name = "Base_SDOH", selected_features = sdoh_feats, tuneGrid = NULL)
+save_models(mget(ls(pattern = "^bayesglm_"), inherits = TRUE), "30_mort_10", clear = TRUE)
+
+###########################
+#### SVM (Radial)
+###########################
+
+# tuneGrid_svm <- expand.grid(C = 1, sigma = 0.05)
+# 
+# train_and_assign(model_type = "svmRadial", feature_set_name = "Base", selected_features = base_feats, tuneGrid = tuneGrid_svm)
+# save_models(mget(ls(pattern = "^svmRadial_"), inherits = TRUE), "30_mort_10", clear = TRUE)
+# 
+# train_and_assign(model_type = "svmRadial", feature_set_name = "Base_SDOH", selected_features = sdoh_feats, tuneGrid = tuneGrid_svm)
+# save_models(mget(ls(pattern = "^svmRadial_"), inherits = TRUE), "30_mort_10", clear = TRUE)
+
+###########################
+#### Naive Bayes
+###########################
+
+train_and_assign(model_type = "naive_bayes", feature_set_name = "Base", selected_features = base_feats, tuneGrid = NULL)
+save_models(mget(ls(pattern = "^naive_bayes_"), inherits = TRUE), "30_mort_10", clear = TRUE)
+
+train_and_assign(model_type = "naive_bayes", feature_set_name = "Base_SDOH", selected_features = sdoh_feats, tuneGrid = NULL)
+save_models(mget(ls(pattern = "^naive_bayes_"), inherits = TRUE), "30_mort_10", clear = TRUE)
+
+###########################
+#### K-Nearest Neighbors
+###########################
+
+tuneGrid_knn <- expand.grid(k = 10)
+
+train_and_assign(model_type = "knn", feature_set_name = "Base", selected_features = base_feats, tuneGrid = tuneGrid_knn)
+save_models(mget(ls(pattern = "^knn_"), inherits = TRUE), "30_mort_10", clear = TRUE)
+
+train_and_assign(model_type = "knn", feature_set_name = "Base_SDOH", selected_features = sdoh_feats, tuneGrid = tuneGrid_knn)
+save_models(mget(ls(pattern = "^knn_"), inherits = TRUE), "30_mort_10", clear = TRUE)
+
+
+```
+
+```{r feat.sel.4.7.mort30.save}
+
+matching_models_los_fs <- mget(
+  ls(pattern = model_run, envir = .GlobalEnv),
+  envir = .GlobalEnv
+)
+
+save_models(matching_models_los_fs, subfolder = "mort30_10")
+
+```
+
+```{r feat.sel.4.7.mort30}
+
+feature_selection_results_30mort <- list()
+
+# Load from saved models
+files <- list.files(here("models", "30_mort_10"), pattern = "\\.rds$", full.names = TRUE)
+
+for (file in files) {
+  model_name <- sub("\\.rds$", "", basename(file))
+  model_obj <- readRDS(file)
+ 
+  if (grepl("^knn", model_name)) {
+    message("Skipping KNN model: ", model_name)
+    next
+  }
+
+
+  message("Feature selection for model: ", model_name)
+
+  model_input <- get_model_data_and_features(model_obj, target = "mortality_30_day")
+
+  selected_feats <- feature_selection(
+    model = model_obj,
+    target = "mortality_30_day",
+    features = model_input$features,
+    dataset = model_input$data,
+    return_stats = TRUE
+  )
+
+  if ("Overall" %in% colnames(selected_feats)) {
+    selected_names <- selected_feats$feature[selected_feats$Overall > 0]
+  } else {
+    selected_names <- selected_feats$feature
+  }
+
+  removed_feats <- setdiff(model_input$features, selected_names)
+
+  feature_selection_results_30mort[[model_name]] <- list(
+    selected = selected_feats[selected_feats$feature %in% selected_names, , drop = FALSE],
+    removed = removed_feats
+  )
+
+  saveRDS(
+    feature_selection_results_30mort,
+    here::here("data", "metadata", "feature_selection_results_30mort.rds")
+  )
+
+  rm(model_obj); gc()  # Clear memory
+}
+
+
+```
+
+```{r feat.sel.4.7.30mort.review}
+
+mort30_results <- readRDS(here::here("data", "metadata", "feature_selection_results_30mort.rds"))
+
+# Get all unique removed features across all models
+all_removed <- unique(unlist(lapply(feature_selection_results_30mort, function(x) x$removed)))
+
+# Create a matrix: rows = features, cols = models
+removed_matrix <- sapply(names(feature_selection_results_30mort), function(model_name) {
+  removed <- feature_selection_results_30mort[[model_name]]$removed
+  all_removed %in% removed
+})
+
+# Convert to data frame
+removed_df <- as.data.frame(removed_matrix)
+rownames(removed_df) <- all_removed
+
+removed_df_pretty <- removed_df
+removed_df_pretty[] <- lapply(removed_df_pretty, function(col) ifelse(col, "X", "-"))
+
+t_4_7_1_removed_30mort <- removed_df_pretty
+write.csv(t_4_7_1_removed_30mort, file = "../presentations/figures/t_4_7_1_removed_30mort.csv", row.names = TRUE, fileEncoding = "UTF-8")
+
+```
+
+```{r tunning.4.7.30mort.inputs}
+
+# Load Featurte Sets
+source(here("scripts", "feature_sets.R"))
+# Load utilities
+source(here("scripts", "utils.R"))
+
+# Load 20% Data Sample for tuning
+data_hosp <- load_dataset("data_hosp_25_log.rds")
+
+source(here("scripts", "figs_funcs.R"))
+
+features_no_sdoh_log_h_mort         <- readRDS(here("data", "metadata", "features_no_sdoh_log_h_mort.rds"))
+features_sdoh_log_h_mort            <- readRDS(here("data", "metadata", "features_sdoh_log_h_mort.rds"))
+features_no_sdoh_log_30_mort        <- readRDS(here("data", "metadata", "features_no_sdoh_log_30_mort.rds"))
+features_sdoh_log_30_mort           <- readRDS(here("data", "metadata", "features_sdoh_log_30_mort.rds"))
+features_no_sdoh_log_readmit        <- readRDS(here("data", "metadata", "features_no_sdoh_log_readmit.rds"))
+features_sdoh_log_readmit           <- readRDS(here("data", "metadata", "features_sdoh_log_readmit.rds"))
+
+feature_selection_results_30mort <- readRDS(here("data", "metadata", "feature_selection_results_30mort.rds"))
+
+set.seed(42)
+train_function = "train_single_model2"
+data <- data_hosp
+dataset_name <- "Samp_25"
+target <- "mortality_30_day"
+file_name <- "mort30_tuning.csv"
+slices <- 4
+model_run <- "Mort30_tuning"
+split_type <- "patient"
+train_size <- 0.7
+cv_splits <- 4
+final_model <- FALSE
+
+```
+
+```{r tunning.4.7.30mort.train}
+
+##############################
+### Tunning Grids
+##############################
+
+# XGBoost
+tuneGrid_xgb <- expand.grid(
+  nrounds = c(100, 200),
+  max_depth = c(3, 6, 9),
+  eta = c(0.01, 0.1, 0.3),
+  gamma = 0,
+  colsample_bytree = 1,
+  min_child_weight = 1,
+  subsample = 1
+)
+
+# GBM
+tuneGrid_gbm <- expand.grid(
+  interaction.depth = c(1, 3, 5),
+  n.trees = c(50, 100),
+  shrinkage = c(0.05, 0.1),
+  n.minobsinnode = c(5, 10)
+)
+
+# Random Forest
+tuneGrid_rf <- expand.grid(
+  mtry = c(2,4) # mtry = c(2, 4, 6, 8)
+)
+
+set.seed(42)
+
+##############################
+### XGBoost (Gradient Boosted Trees)
+##############################
+
+# nrounds = 200; max_depth = 6; eta = 0.1; gamma = 0; colsample_bytree = 1; min_child_weight = 1; subsample = 1
+train_and_assign(
+  model_type = "xgbTree",
+  feature_set_name = "Base_SDOH",
+  selected_features = get_training_ready_features(
+    "xgbTree", "base_sdoh", "mortality_30_day", "mort30_feat_sel", feature_selection_results_30mort, features_sdoh_log_30_mort),
+  tuneGrid = tuneGrid_xgb
+)
+
+save_models(mget(ls(pattern = "^xgbTree_"), inherits = TRUE), "Mort30_25", clear = TRUE)
+
+# train_and_assign(
+#   model_type = "xgbTree",
+#   feature_set_name = "Base",
+#   selected_features = get_training_ready_features(
+#     "xgbTree", "base", "mortality_30_day", "mort30_feat_sel", feature_selection_results_30mort, features_no_sdoh_log_30_mort),
+#   tuneGrid = tuneGrid_xgb
+# )
+
+##############################
+### GBM (Gradient Boosting Machines)
+##############################
+
+# interaction.depth = 5; n.trees = 100; shrinkage = 0.1; n.minobsinnode = 5
+train_and_assign(
+  model_type = "gbm",
+  feature_set_name = "Base_SDOH",
+  selected_features = get_training_ready_features(
+    "gbm", "base_sdoh", "mortality_30_day", "mort30_feat_sel", feature_selection_results_30mort, features_sdoh_log_30_mort),
+  tuneGrid = tuneGrid_gbm
+)
+
+save_models(mget(ls(pattern = "^gbm"), inherits = TRUE), "Mort30_25", clear = TRUE)
+
+# train_and_assign(
+#   model_type = "gbm",
+#   feature_set_name = "Base",
+#   selected_features = get_training_ready_features(
+#     "gbm", "base", "mortality_30_day", "mort30_feat_sel", feature_selection_results_30mort, features_no_sdoh_log_30_mort),
+#   tuneGrid = tuneGrid_gbm
+# )
+
+##############################
+### Random Forest
+##############################
+
+
+train_and_assign(
+  model_type = "rf",
+  feature_set_name = "Base_SDOH",
+  selected_features = get_training_ready_features(
+    "rf", "base_sdoh", "mortality_30_day", "mort30_feat_sel", feature_selection_results_30mort, features_sdoh_log_30_mort),
+  tuneGrid = tuneGrid_rf
+)
+save_models(mget(ls(pattern = "^rf"), inherits = TRUE), "Mort30_25", clear = TRUE)
+
+# train_and_assign(
+#   model_type = "rf",
+#   feature_set_name = "Base",
+#   selected_features = get_training_ready_features(
+#     "rf", "base", "mortality_30_day", "mort30_feat_sel", feature_selection_results_30mort, features_no_sdoh_log_30_mort),
+#   tuneGrid = tuneGrid_rf
+# )
+
+
+```
+
+```{r final.4.7.30mort.inputs}
+
+# Load Featurte Sets
+source(here("scripts", "feature_sets.R"))
+# Load utilities
+source(here("scripts", "utils.R"))
+
+# Load 20% Data Sample for tuning
+data_hosp <- load_dataset("data_hosp_50_log.rds")
+
+source(here("scripts", "figs_funcs.R"))
+
+features_no_sdoh_log_h_mort         <- readRDS(here("data", "metadata", "features_no_sdoh_log_h_mort.rds"))
+features_sdoh_log_h_mort            <- readRDS(here("data", "metadata", "features_sdoh_log_h_mort.rds"))
+features_no_sdoh_log_30_mort        <- readRDS(here("data", "metadata", "features_no_sdoh_log_30_mort.rds"))
+features_sdoh_log_30_mort           <- readRDS(here("data", "metadata", "features_sdoh_log_30_mort.rds"))
+features_no_sdoh_log_readmit        <- readRDS(here("data", "metadata", "features_no_sdoh_log_readmit.rds"))
+features_sdoh_log_readmit           <- readRDS(here("data", "metadata", "features_sdoh_log_readmit.rds"))
+
+feature_selection_results_30mort <- readRDS(here("data", "metadata", "feature_selection_results_30mort.rds"))
+
+set.seed(42)
+train_function = "train_single_model2"
+data <- data_hosp
+dataset_name <- "Final"
+target <- "mortality_30_day"
+file_name <- "mort30_final.csv"
+slices <- 1
+model_run <- "Mort30_final"
+split_type <- "patient"
+train_size <- 0.7
+cv_splits <- 1
+final_model <- TRUE
+
+```
+
+```{r Final.4.7.1.30mort.train}
+
+##############################
+### Tunning Grids
+##############################
+
+# XGBoost
+tuneGrid_bestxgb <- expand.grid(
+  nrounds = c(200),
+  max_depth = c(3),
+  eta = c(0.01),
+  gamma = 0,
+  colsample_bytree = 1,
+  min_child_weight = 1,
+  subsample = 1
+)
+
+# GBM
+tuneGrid_bestgbm <- expand.grid(
+  interaction.depth = c(3),
+  n.trees = c(50),
+  shrinkage = c(0.1),
+  n.minobsinnode = c(10)
+)
+
+# Random Forest
+tuneGrid_bestrf <- expand.grid(
+  mtry = c(2) 
+)
+
+set.seed(42)
+
+##############################
+### XGBoost (Gradient Boosted Trees)
+##############################
+  
+# nrounds = 200; max_depth = 3; eta = 0.01; gamma = 0; colsample_bytree = 1; min_child_weight = 1; subsample = 1
+
+train_and_assign(
+  model_type = "xgbTree",
+  feature_set_name = "Base_SDOH",
+  selected_features = get_training_ready_features(
+    "xgbTree", "base_sdoh", "mortality_30_day", "mort30_feat_sel", feature_selection_results_30mort, features_sdoh_log_30_mort),
+  tuneGrid = tuneGrid_bestxgb
+)
+
+save_models(mget(ls(pattern = "^xgbTree_"), inherits = TRUE), "Mort30_final", clear = TRUE)
+
+train_and_assign(
+  model_type = "xgbTree",
+  feature_set_name = "Base",
+  selected_features = get_training_ready_features(
+    "xgbTree", "base", "mortality_30_day", "mort30_feat_sel", feature_selection_results_30mort, features_no_sdoh_log_30_mort),
+  tuneGrid = tuneGrid_bestxgb
+)
+
+save_models(mget(ls(pattern = "^xgbTree_"), inherits = TRUE), "Mort30_final", clear = TRUE)
+
+##############################
+### GBM (Gradient Boosting Machines)
+##############################
+
+#interaction.depth = 3; n.trees = 50; shrinkage = 0.1; n.minobsinnode = 10
+
+train_and_assign(
+  model_type = "gbm",
+  feature_set_name = "Base_SDOH",
+  selected_features = get_training_ready_features(
+    "gbm", "base_sdoh", "mortality_30_day", "mort30_feat_sel", feature_selection_results_30mort, features_sdoh_log_30_mort),
+  tuneGrid = tuneGrid_bestgbm
+)
+
+save_models(mget(ls(pattern = "^gbm"), inherits = TRUE), "Mort30_final", clear = TRUE)
+
+train_and_assign(
+  model_type = "gbm",
+  feature_set_name = "Base",
+  selected_features = get_training_ready_features(
+    "gbm", "base", "mortality_30_day", "mort30_feat_sel", feature_selection_results_30mort, features_no_sdoh_log_30_mort),
+  tuneGrid = tuneGrid_bestgbm
+)
+
+save_models(mget(ls(pattern = "^gbm"), inherits = TRUE), "Mort30_final", clear = TRUE)
+
+##############################
+### Random Forest
+##############################
+
+
+train_and_assign(
+  model_type = "rf",
+  feature_set_name = "Base_SDOH",
+  selected_features = get_training_ready_features(
+    "rf", "base_sdoh", "mortality_30_day", "mort30_feat_sel", feature_selection_results_30mort, features_sdoh_log_30_mort),
+  tuneGrid = tuneGrid_bestrf
+)
+save_models(mget(ls(pattern = "^rf"), inherits = TRUE), "Mort30_final", clear = TRUE)
+
+train_and_assign(
+  model_type = "rf",
+  feature_set_name = "Base",
+  selected_features = get_training_ready_features(
+    "rf", "base", "mortality_30_day", "mort30_feat_sel", feature_selection_results_30mort, features_no_sdoh_log_30_mort),
+  tuneGrid = tuneGrid_bestrf
+)
+
+save_models(mget(ls(pattern = "^rf"), inherits = TRUE), "Mort30_final", clear = TRUE)
+
+```
+
+### Model Training & Feature Selection - Mort Hospital
+
+
+```{r feat.sel.4.7.morthosp.inputs}
+
+### "mortality_30_day", "readmitted", "hospital_expire_flag", "length_of_stay"
+data_hosp <- load_dataset("data_hosp_10_log.rds")
+
+set.seed(42)
+train_function = "train_single_model2"
+data <- data_hosp
+dataset_name <- "Samp_10"
+target <- "hospital_expire_flag"
+file_name <- "morthosp_feat_sel.csv"
+slices <- 4
+model_run <- "morthosp_feat_sel"
+split_type <- "patient"
+train_size <- 0.7
+cv_splits <- 4
+final_model <- FALSE
+
+```
+
+```{r feat.sel.4.7.morthosp.train}
+
+set.seed(42)
+
+# === Feature Sets
+base_feats  <- features_no_sdoh_log_h_mort
+sdoh_feats  <- features_sdoh_log_h_mort
+
+###########################
+#### XGBoost
+###########################
+
+tuneGrid_xgb <- expand.grid(
+  nrounds = 200,
+  max_depth = 6,
+  eta = 0.3,
+  gamma = 0,
+  colsample_bytree = 1,
+  min_child_weight = 1,
+  subsample = 1
+)
+
+train_and_assign(model_type = "xgbTree", feature_set_name = "Base", selected_features = base_feats, tuneGrid = tuneGrid_xgb)
+save_models(mget(ls(pattern = "^xgbTree_"), inherits = TRUE), "30_hosp_10", clear = TRUE)
+
+train_and_assign(model_type = "xgbTree", feature_set_name = "Base_SDOH", selected_features = sdoh_feats, tuneGrid = tuneGrid_xgb)
+save_models(mget(ls(pattern = "^xgbTree_"), inherits = TRUE), "30_hosp_10", clear = TRUE)
+
+###########################
+#### GBM
+###########################
+
+tuneGrid_gbm <- expand.grid(
+  interaction.depth = 3,
+  n.trees = 100,
+  shrinkage = 0.1,
+  n.minobsinnode = 10
+)
+
+train_and_assign(model_type = "gbm", feature_set_name = "Base", selected_features = base_feats, tuneGrid = tuneGrid_gbm)
+save_models(mget(ls(pattern = "^gbm_"), inherits = TRUE), "30_hosp_10", clear = TRUE)
+
+train_and_assign(model_type = "gbm", feature_set_name = "Base_SDOH", selected_features = sdoh_feats, tuneGrid = tuneGrid_gbm)
+save_models(mget(ls(pattern = "^gbm_"), inherits = TRUE), "30_hosp_10", clear = TRUE)
+
+###########################
+#### Random Forest
+###########################
+
+tuneGrid_rf <- expand.grid(mtry = 2)
+
+train_and_assign(model_type = "rf", feature_set_name = "Base", selected_features = base_feats, tuneGrid = tuneGrid_rf)
+save_models(mget(ls(pattern = "^rf_"), inherits = TRUE), "30_hosp_10", clear = TRUE)
+
+train_and_assign(model_type = "rf", feature_set_name = "Base_SDOH", selected_features = sdoh_feats, tuneGrid = tuneGrid_rf)
+save_models(mget(ls(pattern = "^rf_"), inherits = TRUE), "30_hosp_10", clear = TRUE)
+
+# ###########################
+# #### Neural Network
+# ###########################
+
+tuneGrid_nnet <- expand.grid(size = 5, decay = 0.1)
+
+train_and_assign(model_type = "nnet", feature_set_name = "Base", selected_features = base_feats, tuneGrid = tuneGrid_nnet)
+save_models(mget(ls(pattern = "^nnet_"), inherits = TRUE), "30_hosp_10", clear = TRUE)
+
+train_and_assign(model_type = "nnet", feature_set_name = "Base_SDOH", selected_features = sdoh_feats, tuneGrid = tuneGrid_nnet)
+save_models(mget(ls(pattern = "^nnet_"), inherits = TRUE), "30_hosp_10", clear = TRUE)
+
+# ###########################
+# #### Logistic Regression
+# ###########################
+
+train_and_assign(model_type = "glm", feature_set_name = "Base", selected_features = base_feats, tuneGrid = NULL)
+save_models(mget(ls(pattern = "^glm_"), inherits = TRUE), "30_hosp_10", clear = TRUE)
+
+train_and_assign(model_type = "glm", feature_set_name = "Base_SDOH", selected_features = sdoh_feats, tuneGrid = NULL)
+save_models(mget(ls(pattern = "^glm_"), inherits = TRUE), "30_hosp_10", clear = TRUE)
+
+# ###########################
+# #### GLMNet (Ridge, Lasso, Elastic Net)
+# ###########################
+
+tuneGrid_glmnet <- expand.grid(
+  alpha = .5,
+  lambda = 0.1
+)
+
+train_and_assign(model_type = "glmnet", feature_set_name = "Base", selected_features = base_feats, tuneGrid = tuneGrid_glmnet)
+save_models(mget(ls(pattern = "^glmnet_"), inherits = TRUE), "30_hosp_10", clear = TRUE)
+
+train_and_assign(model_type = "glmnet", feature_set_name = "Base_SDOH", selected_features = sdoh_feats, tuneGrid = tuneGrid_glmnet)
+save_models(mget(ls(pattern = "^glmnet_"), inherits = TRUE), "30_hosp_10", clear = TRUE)
+
+# ###########################
+# #### Bayesian Logistic Regression
+# ###########################
+
+train_and_assign(model_type = "bayesglm", feature_set_name = "Base", selected_features = base_feats, tuneGrid = NULL)
+save_models(mget(ls(pattern = "^bayesglm_"), inherits = TRUE), "30_hosp_10", clear = TRUE)
+
+train_and_assign(model_type = "bayesglm", feature_set_name = "Base_SDOH", selected_features = sdoh_feats, tuneGrid = NULL)
+save_models(mget(ls(pattern = "^bayesglm_"), inherits = TRUE), "30_hosp_10", clear = TRUE)
+
+# ###########################
+# #### SVM (Radial)
+# ###########################
+# 
+# # tuneGrid_svm <- expand.grid(C = 1, sigma = 0.05)
+# # 
+# # train_and_assign(model_type = "svmRadial", feature_set_name = "Base", selected_features = base_feats, tuneGrid = tuneGrid_svm)
+# # save_models(mget(ls(pattern = "^svmRadial_"), inherits = TRUE), "30_hosp_10", clear = TRUE)
+# # 
+# # train_and_assign(model_type = "svmRadial", feature_set_name = "Base_SDOH", selected_features = sdoh_feats, tuneGrid = tuneGrid_svm)
+# # save_models(mget(ls(pattern = "^svmRadial_"), inherits = TRUE), "30_hosp_10", clear = TRUE)
+
+###########################
+#### Naive Bayes
+###########################
+
+train_and_assign(model_type = "naive_bayes", feature_set_name = "Base", selected_features = base_feats, tuneGrid = NULL)
+save_models(mget(ls(pattern = "^naive_bayes_"), inherits = TRUE), "30_hosp_10", clear = TRUE)
+
+train_and_assign(model_type = "naive_bayes", feature_set_name = "Base_SDOH", selected_features = sdoh_feats, tuneGrid = NULL)
+save_models(mget(ls(pattern = "^naive_bayes_"), inherits = TRUE), "30_hosp_10", clear = TRUE)
+
+###########################
+#### K-Nearest Neighbors
+###########################
+
+tuneGrid_knn <- expand.grid(k = 10)
+
+train_and_assign(model_type = "knn", feature_set_name = "Base", selected_features = base_feats, tuneGrid = tuneGrid_knn)
+save_models(mget(ls(pattern = "^knn_"), inherits = TRUE), "30_hosp_10", clear = TRUE)
+
+train_and_assign(model_type = "knn", feature_set_name = "Base_SDOH", selected_features = sdoh_feats, tuneGrid = tuneGrid_knn)
+save_models(mget(ls(pattern = "^knn_"), inherits = TRUE), "30_hosp_10", clear = TRUE)
+
+```
+
+```{r feat.sel.4.7.morthosp}
+
+feature_selection_results_hospmort <- list()
+
+# Load from saved models
+files <- list.files(here("models", "Hosp_10"), pattern = "\\.rds$", full.names = TRUE)
+
+for (file in files) {
+  model_name <- sub("\\.rds$", "", basename(file))
+  model_obj <- readRDS(file)
+
+  if (!grepl("^gbm_base_h", model_name)) {
+    message("Skipping model: ", model_name)
+    next
+  }
+  
+    if (grepl("^knn", model_name)) {
+    message("Skipping KNN model: ", model_name)
+    next
+  }
+  
+  message("Feature selection for model: ", model_name)
+
+  model_input <- get_model_data_and_features(model_obj, target = "hospital_expire_flag")
+
+  selected_feats <- feature_selection(
+    model = model_obj,
+    target = "hospital_expire_flag",
+    features = model_input$features,
+    dataset = model_input$data,
+    return_stats = TRUE
+  )
+
+  if ("Overall" %in% colnames(selected_feats)) {
+    selected_names <- selected_feats$feature[selected_feats$Overall > 0]
+  } else {
+    selected_names <- selected_feats$feature
+  }
+
+  removed_feats <- setdiff(model_input$features, selected_names)
+
+  feature_selection_results_hospmort[[model_name]] <- list(
+    selected = selected_feats,
+    removed = removed_feats
+  )
+
+  saveRDS(
+    feature_selection_results_hospmort,
+    here::here("data", "metadata", "feature_selection_results_hospmort_gbm_base.rds")
+  )
+
+  rm(model_obj); gc()  # Clear memory
+}
+
+
+```
+
+```{r feat.sel.4.7.morthosp.review}
+
+feature_selection_results_hospmort <- readRDS(here::here("data", "metadata", "feature_selection_results_hospmort.rds"))
+
+# Get all unique removed features across all models
+all_removed <- unique(unlist(lapply(feature_selection_results_hospmort, function(x) x$removed)))
+
+# Create a matrix: rows = features, cols = models
+removed_matrix <- sapply(names(feature_selection_results_hospmort), function(model_name) {
+  removed <- feature_selection_results_hospmort[[model_name]]$removed
+  all_removed %in% removed
+})
+
+# Convert to data frame
+removed_df <- as.data.frame(removed_matrix)
+rownames(removed_df) <- all_removed
+
+removed_df_pretty <- removed_df
+removed_df_pretty[] <- lapply(removed_df_pretty, function(col) ifelse(col, "X", "-"))
+
+t_4_7_1_removed_hospmort <- removed_df_pretty
+write.csv(t_4_7_1_removed_hospmort, file = "../presentations/figures/t_4_7_1_removed_hospmort_2.csv", row.names = TRUE, fileEncoding = "UTF-8")
+
+```
+
+```{r tunning.4.7.morthosp.inputs}
+
+# Load Featurte Sets
+source(here("scripts", "feature_sets.R"))
+# Load utilities
+source(here("scripts", "utils.R"))
+
+# Load 20% Data Sample for tuning
+data_hosp <- load_dataset("data_hosp_25_log.rds")
+
+source(here("scripts", "figs_funcs.R"))
+
+features_no_sdoh_log_h_mort         <- readRDS(here("data", "metadata", "features_no_sdoh_log_h_mort.rds"))
+features_sdoh_log_h_mort            <- readRDS(here("data", "metadata", "features_sdoh_log_h_mort.rds"))
+features_no_sdoh_log_30_mort        <- readRDS(here("data", "metadata", "features_no_sdoh_log_30_mort.rds"))
+features_sdoh_log_30_mort           <- readRDS(here("data", "metadata", "features_sdoh_log_30_mort.rds"))
+features_no_sdoh_log_readmit        <- readRDS(here("data", "metadata", "features_no_sdoh_log_readmit.rds"))
+features_sdoh_log_readmit           <- readRDS(here("data", "metadata", "features_sdoh_log_readmit.rds"))
+
+feature_selection_results_hospmort <- readRDS(here("data", "metadata", "feature_selection_results_hospmort.rds"))
+feature_selection_results_hospmort_gbm_base <- readRDS(here("data", "metadata", "feature_selection_results_hospmort_gbm_base.rds"))
+
+set.seed(42)
+train_function = "train_single_model2"
+data <- data_hosp
+dataset_name <- "Samp_25"
+target <- "hospital_expire_flag"
+file_name <- "morthosp_tuning.csv"
+slices <- 4
+model_run <- "Morthosp_tuning"
+split_type <- "patient"
+train_size <- 0.7
+cv_splits <- 4
+final_model <- FALSE
+
+```
+
+```{r tunning.4.7.morthosp.train}
+
+##############################
+### Tunning Grids
+##############################
+
+# XGBoost
+tuneGrid_xgb <- expand.grid(
+  nrounds = c(100, 200),
+  max_depth = c(3, 6, 9),
+  eta = c(0.01, 0.1, 0.3),
+  gamma = 0,
+  colsample_bytree = 1,
+  min_child_weight = 1,
+  subsample = 1
+)
+
+# GBM
+tuneGrid_gbm <- expand.grid(
+  interaction.depth = c(1, 3, 5),
+  n.trees = c(50, 100),
+  shrinkage = c(0.05, 0.1),
+  n.minobsinnode = c(5, 10)
+)
+
+# Random Forest
+tuneGrid_rf <- expand.grid(
+  mtry = c(2,4) # mtry = c(2, 4, 6, 8)
+)
+
+set.seed(42)
+
+##############################
+### XGBoost (Gradient Boosted Trees)
+##############################
+
+# nrounds = 200; max_depth = 6; eta = 0.1; gamma = 0; colsample_bytree = 1; min_child_weight = 1; subsample = 1
+train_and_assign(
+  model_type = "xgbTree",
+  feature_set_name = "Base_SDOH",
+  selected_features = get_training_ready_features(
+    "xgbTree", "base_sdoh", "hospital_expire_flag", "morthosp_feat_sel", feature_selection_results_hospmort, features_sdoh_log_h_mort),
+  tuneGrid = tuneGrid_xgb
+)
+
+save_models(mget(ls(pattern = "^xgbTree_"), inherits = TRUE), "Morthosp_25", clear = TRUE)
+
+# train_and_assign(
+#   model_type = "xgbTree",
+#   feature_set_name = "Base",
+#   selected_features = get_training_ready_features(
+#     "xgbTree", "base", "hospital_expire_flag", "morthosp_feat_sel", feature_selection_results_hospmort, features_no_sdoh_log_h_mort),
+#   tuneGrid = tuneGrid_xgb
+# )
+
+##############################
+### GBM (Gradient Boosting Machines)
+##############################
+
+# interaction.depth = 5; n.trees = 100; shrinkage = 0.1; n.minobsinnode = 5
+train_and_assign(
+  model_type = "gbm",
+  feature_set_name = "Base_SDOH",
+  selected_features = get_training_ready_features(
+    "gbm", "base_sdoh", "hospital_expire_flag", "morthosp_feat_sel", feature_selection_results_hospmort, features_sdoh_log_h_mort),
+  tuneGrid = tuneGrid_gbm
+)
+
+save_models(mget(ls(pattern = "^gbm"), inherits = TRUE), "Morthosp_25", clear = TRUE)
+
+# train_and_assign(
+#   model_type = "gbm",
+#   feature_set_name = "Base",
+#   selected_features = get_training_ready_features(
+#     "gbm", "base", "hospital_expire_flag", "morthosp_feat_sel", feature_selection_results_hospmort_gbm_base, features_no_sdoh_log_h_mort),
+#   tuneGrid = tuneGrid_gbm
+# )
+
+##############################
+### Random Forest
+##############################
+
+
+train_and_assign(
+  model_type = "rf",
+  feature_set_name = "Base_SDOH",
+  selected_features = get_training_ready_features(
+    "rf", "base_sdoh", "hospital_expire_flag", "morthosp_feat_sel", feature_selection_results_hospmort, features_sdoh_log_h_mort),
+  tuneGrid = tuneGrid_rf
+)
+save_models(mget(ls(pattern = "^rf"), inherits = TRUE), "Morthosp_25", clear = TRUE)
+
+# train_and_assign(
+#   model_type = "rf",
+#   feature_set_name = "Base",
+#   selected_features = get_training_ready_features(
+#     "rf", "base", "hospital_expire_flag", "morthosp_feat_sel", feature_selection_results_hospmort, features_no_sdoh_log_h_mort),
+#   tuneGrid = tuneGrid_rf
+# )
+
+```
+
+```{r final.4.7.morthosp.inputs}
+
+# Load Featurte Sets
+source(here("scripts", "feature_sets.R"))
+# Load utilities
+source(here("scripts", "utils.R"))
+
+# Load 20% Data Sample for tuning
+data_hosp <- load_dataset("data_hosp_50_log.rds")
+
+source(here("scripts", "figs_funcs.R"))
+
+features_no_sdoh_log_h_mort         <- readRDS(here("data", "metadata", "features_no_sdoh_log_h_mort.rds"))
+features_sdoh_log_h_mort            <- readRDS(here("data", "metadata", "features_sdoh_log_h_mort.rds"))
+features_no_sdoh_log_30_mort        <- readRDS(here("data", "metadata", "features_no_sdoh_log_30_mort.rds"))
+features_sdoh_log_30_mort           <- readRDS(here("data", "metadata", "features_sdoh_log_30_mort.rds"))
+features_no_sdoh_log_readmit        <- readRDS(here("data", "metadata", "features_no_sdoh_log_readmit.rds"))
+features_sdoh_log_readmit           <- readRDS(here("data", "metadata", "features_sdoh_log_readmit.rds"))
+
+feature_selection_results_hospmort <- readRDS(here("data", "metadata", "feature_selection_results_hospmort.rds"))
+feature_selection_results_hospmort_gbm_base <- readRDS(here("data", "metadata", "feature_selection_results_hospmort_gbm_base.rds"))
+
+set.seed(42)
+train_function = "train_single_model2"
+data <- data_hosp
+dataset_name <- "Final"
+target <- "hospital_expire_flag"
+file_name <- "morthosp_final.csv"
+slices <- 1
+model_run <- "morthosp_final"
+split_type <- "patient"
+train_size <- 0.7
+cv_splits <- 1
+final_model <- TRUE
+
+```
+
+```{r final.4.7.morthosp.train}
+
+##############################
+### Tunning Grids
+##############################
+
+# XGBoost
+tuneGrid_bestxgb <- expand.grid(
+  nrounds = c(100),
+  max_depth = c(9),
+  eta = c(0.01),
+  gamma = 0,
+  colsample_bytree = 1,
+  min_child_weight = 1,
+  subsample = 1
+)
+
+# GBM
+tuneGrid_bestgbm <- expand.grid(
+  interaction.depth = c(5),
+  n.trees = c(50),
+  shrinkage = c(0.1),
+  n.minobsinnode = c(5)
+)
+
+# Random Forest
+tuneGrid_bestrf <- expand.grid(
+  mtry = c(2) # mtry = c(2, 4, 6, 8)
+)
+
+set.seed(42)
+
+##############################
+### XGBoost (Gradient Boosted Trees)
+##############################
+
+# nrounds = 200; max_depth = 6; eta = 0.1; gamma = 0; colsample_bytree = 1; min_child_weight = 1; subsample = 1
+train_and_assign(
+  model_type = "xgbTree",
+  feature_set_name = "Base_SDOH",
+  selected_features = get_training_ready_features(
+    "xgbTree", "base_sdoh", "hospital_expire_flag", "morthosp_feat_sel", feature_selection_results_hospmort, features_sdoh_log_h_mort),
+  tuneGrid = tuneGrid_bestxgb
+)
+
+save_models(mget(ls(pattern = "^xgbTree_"), inherits = TRUE), "Morthosp_final", clear = TRUE)
+
+train_and_assign(
+  model_type = "xgbTree",
+  feature_set_name = "Base",
+  selected_features = get_training_ready_features(
+    "xgbTree", "base", "hospital_expire_flag", "morthosp_feat_sel", feature_selection_results_hospmort, features_no_sdoh_log_h_mort),
+  tuneGrid = tuneGrid_bestxgb
+)
+
+save_models(mget(ls(pattern = "^xgbTree_"), inherits = TRUE), "Morthosp_final", clear = TRUE)
+
+##############################
+### GBM (Gradient Boosting Machines)
+##############################
+
+# interaction.depth = 5; n.trees = 100; shrinkage = 0.1; n.minobsinnode = 5
+train_and_assign(
+  model_type = "gbm",
+  feature_set_name = "Base_SDOH",
+  selected_features = get_training_ready_features(
+    "gbm", "base_sdoh", "hospital_expire_flag", "morthosp_feat_sel", feature_selection_results_hospmort, features_sdoh_log_h_mort),
+  tuneGrid = tuneGrid_bestgbm
+)
+
+save_models(mget(ls(pattern = "^gbm"), inherits = TRUE), "Morthosp_final", clear = TRUE)
+
+train_and_assign(
+  model_type = "gbm",
+  feature_set_name = "Base",
+  selected_features = get_training_ready_features(
+    "gbm", "base", "hospital_expire_flag", "morthosp_feat_sel", feature_selection_results_hospmort_gbm_base, features_no_sdoh_log_h_mort),
+  tuneGrid = tuneGrid_bestgbm
+)
+
+save_models(mget(ls(pattern = "^gbm"), inherits = TRUE), "Morthosp_final", clear = TRUE)
+
+##############################
+### Random Forest
+##############################
+
+
+train_and_assign(
+  model_type = "rf",
+  feature_set_name = "Base_SDOH",
+  selected_features = get_training_ready_features(
+    "rf", "base_sdoh", "hospital_expire_flag", "morthosp_feat_sel", feature_selection_results_hospmort, features_sdoh_log_h_mort),
+  tuneGrid = tuneGrid_bestrf
+)
+save_models(mget(ls(pattern = "^rf"), inherits = TRUE), "Morthosp_final", clear = TRUE)
+
+train_and_assign(
+  model_type = "rf",
+  feature_set_name = "Base",
+  selected_features = get_training_ready_features(
+    "rf", "base", "hospital_expire_flag", "morthosp_feat_sel", feature_selection_results_hospmort, features_no_sdoh_log_h_mort),
+  tuneGrid = tuneGrid_bestrf
+)
+
+save_models(mget(ls(pattern = "^rf"), inherits = TRUE), "Morthosp_final", clear = TRUE)
+
+```
+
+### Model Training & Feature Selection - Readmitted
+
+```{r feat.sel.4.7.readmit.inputs}
+
+### "mortality_30_day", "readmitted", "hospital_expire_flag", "length_of_stay"
+data_hosp <- load_dataset("data_hosp_10_log.rds")
+
+set.seed(42)
+train_function = "train_single_model2"
+data <- data_hosp
+dataset_name <- "Samp_10"
+target <- "readmitted"
+file_name <- "readmit_feat_sel.csv"
+slices <- 4
+model_run <- "readmit_feat_sel"
+split_type <- "patient"
+train_size <- 0.7
+cv_splits <- 4
+final_model <- FALSE
+
+```
+
+```{r feat.sel.4.7.readmit.train}
+
+set.seed(42)
+
+# === Feature Sets
+base_feats  <- features_no_sdoh_log_readmit
+sdoh_feats  <- features_sdoh_log_readmit
+
+###########################
+#### XGBoost
+###########################
+
+tuneGrid_xgb <- expand.grid(
+  nrounds = 200,
+  max_depth = 6,
+  eta = 0.3,
+  gamma = 0,
+  colsample_bytree = 1,
+  min_child_weight = 1,
+  subsample = 1
+)
+
+train_and_assign(model_type = "xgbTree", feature_set_name = "Base", selected_features = base_feats, tuneGrid = tuneGrid_xgb)
+save_models(mget(ls(pattern = "^xgbTree_"), inherits = TRUE), "Readmit_10", clear = TRUE)
+
+train_and_assign(model_type = "xgbTree", feature_set_name = "Base_SDOH", selected_features = sdoh_feats, tuneGrid = tuneGrid_xgb)
+save_models(mget(ls(pattern = "^xgbTree_"), inherits = TRUE), "Readmit_10", clear = TRUE)
+
+###########################
+#### GBM
+###########################
+
+tuneGrid_gbm <- expand.grid(
+  interaction.depth = 3,
+  n.trees = 100,
+  shrinkage = 0.1,
+  n.minobsinnode = 10
+)
+
+train_and_assign(model_type = "gbm", feature_set_name = "Base", selected_features = base_feats, tuneGrid = tuneGrid_gbm)
+save_models(mget(ls(pattern = "^gbm_"), inherits = TRUE), "Readmit_10", clear = TRUE)
+
+train_and_assign(model_type = "gbm", feature_set_name = "Base_SDOH", selected_features = sdoh_feats, tuneGrid = tuneGrid_gbm)
+save_models(mget(ls(pattern = "^gbm_"), inherits = TRUE), "Readmit_10", clear = TRUE)
+
+###########################
+#### Random Forest
+###########################
+
+tuneGrid_rf <- expand.grid(mtry = 2)
+
+train_and_assign(model_type = "rf", feature_set_name = "Base", selected_features = base_feats, tuneGrid = tuneGrid_rf)
+save_models(mget(ls(pattern = "^rf_"), inherits = TRUE), "Readmit_10", clear = TRUE)
+
+train_and_assign(model_type = "rf", feature_set_name = "Base_SDOH", selected_features = sdoh_feats, tuneGrid = tuneGrid_rf)
+save_models(mget(ls(pattern = "^rf_"), inherits = TRUE), "Readmit_10", clear = TRUE)
+
+###########################
+#### Neural Network
+###########################
+
+tuneGrid_nnet <- expand.grid(size = 5, decay = 0.1)
+
+train_and_assign(model_type = "nnet", feature_set_name = "Base", selected_features = base_feats, tuneGrid = tuneGrid_nnet)
+save_models(mget(ls(pattern = "^nnet_"), inherits = TRUE), "Readmit_10", clear = TRUE)
+
+train_and_assign(model_type = "nnet", feature_set_name = "Base_SDOH", selected_features = sdoh_feats, tuneGrid = tuneGrid_nnet)
+save_models(mget(ls(pattern = "^nnet_"), inherits = TRUE), "Readmit_10", clear = TRUE)
+
+###########################
+#### Logistic Regression
+###########################
+
+train_and_assign(model_type = "glm", feature_set_name = "Base", selected_features = base_feats, tuneGrid = NULL)
+save_models(mget(ls(pattern = "^glm_"), inherits = TRUE), "Readmit_10", clear = TRUE)
+
+train_and_assign(model_type = "glm", feature_set_name = "Base_SDOH", selected_features = sdoh_feats, tuneGrid = NULL)
+save_models(mget(ls(pattern = "^glm_"), inherits = TRUE), "Readmit_10", clear = TRUE)
+
+###########################
+#### GLMNet (Ridge, Lasso, Elastic Net)
+###########################
+
+tuneGrid_glmnet <- expand.grid(
+  alpha = .5,
+  lambda = 0.1
+)
+
+train_and_assign(model_type = "glmnet", feature_set_name = "Base", selected_features = base_feats, tuneGrid = tuneGrid_glmnet)
+save_models(mget(ls(pattern = "^glmnet_"), inherits = TRUE), "Readmit_10", clear = TRUE)
+
+train_and_assign(model_type = "glmnet", feature_set_name = "Base_SDOH", selected_features = sdoh_feats, tuneGrid = tuneGrid_glmnet)
+save_models(mget(ls(pattern = "^glmnet_"), inherits = TRUE), "Readmit_10", clear = TRUE)
+
+###########################
+#### Bayesian Logistic Regression
+###########################
+
+train_and_assign(model_type = "bayesglm", feature_set_name = "Base", selected_features = base_feats, tuneGrid = NULL)
+save_models(mget(ls(pattern = "^bayesglm_"), inherits = TRUE), "Readmit_10", clear = TRUE)
+
+train_and_assign(model_type = "bayesglm", feature_set_name = "Base_SDOH", selected_features = sdoh_feats, tuneGrid = NULL)
+save_models(mget(ls(pattern = "^bayesglm_"), inherits = TRUE), "Readmit_10", clear = TRUE)
+
+###########################
+#### SVM (Radial)
+###########################
+
+# tuneGrid_svm <- expand.grid(C = 1, sigma = 0.05)
+#
+# train_and_assign(model_type = "svmRadial", feature_set_name = "Base", selected_features = base_feats, tuneGrid = tuneGrid_svm)
+# save_models(mget(ls(pattern = "^svmRadial_"), inherits = TRUE), "30_hosp_10", clear = TRUE)
+#
+# train_and_assign(model_type = "svmRadial", feature_set_name = "Base_SDOH", selected_features = sdoh_feats, tuneGrid = tuneGrid_svm)
+# save_models(mget(ls(pattern = "^svmRadial_"), inherits = TRUE), "30_hosp_10", clear = TRUE)
+
+###########################
+#### Naive Bayes
+###########################
+
+train_and_assign(model_type = "naive_bayes", feature_set_name = "Base", selected_features = base_feats, tuneGrid = NULL)
+save_models(mget(ls(pattern = "^naive_bayes_"), inherits = TRUE), "Readmit_10", clear = TRUE)
+
+train_and_assign(model_type = "naive_bayes", feature_set_name = "Base_SDOH", selected_features = sdoh_feats, tuneGrid = NULL)
+save_models(mget(ls(pattern = "^naive_bayes_"), inherits = TRUE), "Readmit_10", clear = TRUE)
+
+###########################
+#### K-Nearest Neighbors
+###########################
+
+tuneGrid_knn <- expand.grid(k = 10)
+
+train_and_assign(model_type = "knn", feature_set_name = "Base", selected_features = base_feats, tuneGrid = tuneGrid_knn)
+save_models(mget(ls(pattern = "^knn_"), inherits = TRUE), "Readmit_10", clear = TRUE)
+
+train_and_assign(model_type = "knn", feature_set_name = "Base_SDOH", selected_features = sdoh_feats, tuneGrid = tuneGrid_knn)
+save_models(mget(ls(pattern = "^knn_"), inherits = TRUE), "Readmit_10", clear = TRUE)
+
+```
+
+```{r feat.sel.4.7.readmit}
+
+feature_selection_results_readmit <- list()
+
+# Load from saved models
+files <- list.files(here("models", "Readmit_10"), pattern = "\\.rds$", full.names = TRUE)
+
+for (file in files) {
+  model_name <- sub("\\.rds$", "", basename(file))
+  model_obj <- readRDS(file)
+
+  if (grepl("^knn", model_name)) {
+    message("Skipping KNN model: ", model_name)
+    next
+  }
+  
+  message("Feature selection for model: ", model_name)
+
+  model_input <- get_model_data_and_features(model_obj, target = "readmitted")
+
+  selected_feats <- feature_selection(
+    model = model_obj,
+    target = "readmitted",
+    features = model_input$features,
+    dataset = model_input$data,
+    return_stats = TRUE
+  )
+
+  if ("Overall" %in% colnames(selected_feats)) {
+    selected_names <- selected_feats$feature[selected_feats$Overall > 0]
+  } else {
+    selected_names <- selected_feats$feature
+  }
+
+  removed_feats <- setdiff(model_input$features, selected_names)
+
+  feature_selection_results_readmit[[model_name]] <- list(
+    selected = selected_feats,
+    removed = removed_feats
+  )
+
+  saveRDS(
+    feature_selection_results_readmit,
+    here::here("data", "metadata", "feature_selection_results_readmit.rds")
+  )
+
+  rm(model_obj); gc()  # Clear memory
+}
+
+```
+
+```{r feat.sel.4.7.readmit.review}
+
+feature_selection_results_readmit <- readRDS(here::here("data", "metadata", "feature_selection_results_readmit.rds"))
+
+# Get all unique removed features across all models
+all_removed <- unique(unlist(lapply(feature_selection_results_readmit, function(x) x$removed)))
+
+# Create a matrix: rows = features, cols = models
+removed_matrix <- sapply(names(feature_selection_results_readmit), function(model_name) {
+  removed <- feature_selection_results_readmit[[model_name]]$removed
+  all_removed %in% removed
+})
+
+# Convert to data frame
+removed_df <- as.data.frame(removed_matrix)
+rownames(removed_df) <- all_removed
+
+removed_df_pretty <- removed_df
+removed_df_pretty[] <- lapply(removed_df_pretty, function(col) ifelse(col, "X", "-"))
+
+t_4_7_1_removed_readmit <- removed_df_pretty
+write.csv(t_4_7_1_removed_readmit, file = "../presentations/figures/t_4_7_1_removed_readmit.csv", row.names = TRUE, fileEncoding = "UTF-8")
+
+```
+
+```{r tunning.4.7.readmit.inputs}
+
+# Load Featurte Sets
+source(here("scripts", "feature_sets.R"))
+# Load utilities
+source(here("scripts", "utils.R"))
+
+# Load 10% Data Sample for tuning
+data_hosp <- load_dataset("data_hosp_10_log.rds")
+
+source(here("scripts", "figs_funcs.R"))
+
+features_no_sdoh_log_h_mort         <- readRDS(here("data", "metadata", "features_no_sdoh_log_h_mort.rds"))
+features_sdoh_log_h_mort            <- readRDS(here("data", "metadata", "features_sdoh_log_h_mort.rds"))
+features_no_sdoh_log_30_mort        <- readRDS(here("data", "metadata", "features_no_sdoh_log_30_mort.rds"))
+features_sdoh_log_30_mort           <- readRDS(here("data", "metadata", "features_sdoh_log_30_mort.rds"))
+features_no_sdoh_log_readmit        <- readRDS(here("data", "metadata", "features_no_sdoh_log_readmit.rds"))
+features_sdoh_log_readmit           <- readRDS(here("data", "metadata", "features_sdoh_log_readmit.rds"))
+
+feature_selection_results_readmit <- readRDS(here("data", "metadata", "feature_selection_results_readmit.rds"))
+
+set.seed(42)
+train_function = "train_single_model3"
+data <- data_hosp
+dataset_name <- "Samp_25"
+target <- "readmitted"
+file_name <- "readmit_tuning_2.csv"
+slices <- 4
+model_run <- "readmit_tuning_2"
+split_type <- "patient"
+train_size <- 0.7
+cv_splits <- 4
+final_model <- FALSE
+
+```
+
+```{r tunning.4.7.readmit.train}
+
+##############################
+### Tunning Grids
+##############################
+
+# Neural Network
+tuneGrid_nnet <- expand.grid(
+  size = c(3, 5, 7),     # Number of hidden units
+  decay = c(0.01, 0.1, 0.5)  # Weight decay (regularization)
+)
+
+set.seed(42)
+
+##############################
+### Neural Network
+##############################
+
+train_and_assign(
+  model_type = "nnet",
+  feature_set_name = "Base_SDOH",
+  selected_features = get_training_ready_features(
+    "nnet", "base_sdoh", "readmitted", "readmit_feat_sel", feature_selection_results_readmit, features_sdoh_log_readmit),
+  tuneGrid = tuneGrid_nnet
+)
+
+save_models(mget(ls(pattern = "^nnet"), inherits = TRUE), "Readmit_10_2", clear = TRUE)
+
+# train_and_assign(
+#   model_type = "nnet",
+#   feature_set_name = "Base",
+#   selected_features = get_training_ready_features(
+#     "nnet", "base", "readmitted", "readmit_feat_sel", feature_selection_results_readmit, features_no_sdoh_log_readmit),
+#   tuneGrid = tuneGrid_nnet
+# )
+
+##############################
+### Logistic Regression
+##############################
+
+train_and_assign(
+  model_type = "glm",
+  feature_set_name = "Base_SDOH",
+  selected_features = get_training_ready_features(
+    "glm", "base_sdoh", "readmitted", "readmit_feat_sel", feature_selection_results_readmit, features_sdoh_log_readmit)
+  )
+
+save_models(mget(ls(pattern = "^glm"), inherits = TRUE), "Readmit_25", clear = TRUE)
+
+train_and_assign(
+  model_type = "glm",
+  feature_set_name = "Base",
+  selected_features = get_training_ready_features(
+    "glm", "base", "readmitted", "readmit_feat_sel", feature_selection_results_readmit, features_no_sdoh_log_readmit)
+)
+
+##############################
+### Bayesian Logistic Regression
+##############################
+
+train_and_assign(
+  model_type = "bayesglm",
+  feature_set_name = "Base_SDOH",
+  selected_features = get_training_ready_features(
+    "bayesglm", "base_sdoh", "readmitted", "readmit_feat_sel", feature_selection_results_readmit,  features_sdoh_log_readmit),
+)
+save_models(mget(ls(pattern = "^bayesglm"), inherits = TRUE), "Readmit_25", clear = TRUE)
+
+train_and_assign(
+  model_type = "bayesglm",
+  feature_set_name = "Base",
+  selected_features = get_training_ready_features(
+    "bayesglm", "base", "readmitted", "readmit_feat_sel", feature_selection_results_readmit, features_no_sdoh_log_readmit),
+  tuneGrid = tuneGrid_bayesglm
+)
+
+```
+
+```{r final.4.7.readmit.inputs}
+
+# Load Featurte Sets
+source(here("scripts", "feature_sets.R"))
+# Load utilities
+source(here("scripts", "utils.R"))
+
+# Load 50% Data Sample for final
+data_hosp <- load_dataset("data_hosp_100_log.rds")
+
+source(here("scripts", "figs_funcs.R"))
+
+features_no_sdoh_log_h_mort         <- readRDS(here("data", "metadata", "features_no_sdoh_log_h_mort.rds"))
+features_sdoh_log_h_mort            <- readRDS(here("data", "metadata", "features_sdoh_log_h_mort.rds"))
+features_no_sdoh_log_30_mort        <- readRDS(here("data", "metadata", "features_no_sdoh_log_30_mort.rds"))
+features_sdoh_log_30_mort           <- readRDS(here("data", "metadata", "features_sdoh_log_30_mort.rds"))
+features_no_sdoh_log_readmit        <- readRDS(here("data", "metadata", "features_no_sdoh_log_readmit.rds"))
+features_sdoh_log_readmit           <- readRDS(here("data", "metadata", "features_sdoh_log_readmit.rds"))
+
+feature_selection_results_readmit <- readRDS(here("data", "metadata", "feature_selection_results_readmit.rds"))
+
+set.seed(42)
+train_function = "train_single_model2"
+data <- data_hosp
+dataset_name <- "final"
+target <- "readmitted"
+file_name <- "readmit_final.csv"
+slices <- 1
+model_run <- "readmit_final"
+split_type <- "patient"
+train_size <- 0.7
+cv_splits <- 1
+final_model <- TRUE
+
+```
+
+```{r final.4.7.readmit.train}
+
+##############################
+### Tunning Grids
+##############################
+
+# Neural Network
+tuneGrid_bestnnet <- expand.grid(
+  size = c(5),     # Number of hidden units
+  decay = c(0.5)  # Weight decay (regularization)
+)
+
+set.seed(42)
+
+##############################
+### Neural Network
+##############################
+
+train_and_assign(
+  model_type = "nnet",
+  feature_set_name = "Base_SDOH",
+  selected_features = get_training_ready_features(
+    "nnet", "base_sdoh", "readmitted", "readmit_feat_sel", feature_selection_results_readmit, features_sdoh_log_readmit),
+  tuneGrid = tuneGrid_bestnnet
+)
+
+save_models(mget(ls(pattern = "^nnet"), inherits = TRUE), "Readmit_final", clear = TRUE)
+
+train_and_assign(
+  model_type = "nnet",
+  feature_set_name = "Base",
+  selected_features = get_training_ready_features(
+    "nnet", "base", "readmitted", "readmit_feat_sel", feature_selection_results_readmit, features_no_sdoh_log_readmit),
+  tuneGrid = tuneGrid_bestnnet
+)
+
+save_models(mget(ls(pattern = "^nnet"), inherits = TRUE), "Readmit_final", clear = TRUE)
+
+##############################
+### Logistic Regression
+##############################
+
+train_and_assign(
+  model_type = "glm",
+  feature_set_name = "Base_SDOH",
+  selected_features = get_training_ready_features(
+    "glm", "base_sdoh", "readmitted", "readmit_feat_sel", feature_selection_results_readmit, features_sdoh_log_readmit)
+  )
+
+save_models(mget(ls(pattern = "^glm"), inherits = TRUE), "Readmit_final", clear = TRUE)
+
+train_and_assign(
+  model_type = "glm",
+  feature_set_name = "Base",
+  selected_features = get_training_ready_features(
+    "glm", "base", "readmitted", "readmit_feat_sel", feature_selection_results_readmit, features_no_sdoh_log_readmit)
+)
+
+save_models(mget(ls(pattern = "^glm"), inherits = TRUE), "Readmit_final", clear = TRUE)
+
+##############################
+### Bayesian Logistic Regression
+##############################
+
+train_and_assign(
+  model_type = "bayesglm",
+  feature_set_name = "Base_SDOH",
+  selected_features = get_training_ready_features(
+    "bayesglm", "base_sdoh", "readmitted", "readmit_feat_sel", feature_selection_results_readmit,  features_sdoh_log_readmit),
+)
+save_models(mget(ls(pattern = "^bayesglm"), inherits = TRUE), "Readmit_final", clear = TRUE)
+
+train_and_assign(
+  model_type = "bayesglm",
+  feature_set_name = "Base",
+  selected_features = get_training_ready_features(
+    "bayesglm", "base", "readmitted", "readmit_feat_sel", feature_selection_results_readmit, features_no_sdoh_log_readmit),
+)
+
+save_models(mget(ls(pattern = "^bayesglm"), inherits = TRUE), "Readmit_final", clear = TRUE)
+
+```
+
+### Mitigation
+
+
+
+```{r feat.sel.4.7.morthosp.inputs}
+
+# Load Featurte Sets
+source(here("scripts", "feature_sets.R"))
+# Load utilities
+source(here("scripts", "utils.R"))
+
+# Load 10% Data Sample for EDA
+data_hosp <- load_dataset("data_hosp_10_log.rds")
+# Load Functions
+source(here("scripts", "figs_funcs.R"))
+
+features_no_sdoh_log_h_mort         <- readRDS(here("data", "metadata", "features_no_sdoh_log_h_mort.rds"))
+features_sdoh_log_h_mort            <- readRDS(here("data", "metadata", "features_sdoh_log_h_mort.rds"))
+features_no_sdoh_log_30_mort        <- readRDS(here("data", "metadata", "features_no_sdoh_log_30_mort.rds"))
+features_sdoh_log_30_mort           <- readRDS(here("data", "metadata", "features_sdoh_log_30_mort.rds"))
+features_no_sdoh_log_readmit        <- readRDS(here("data", "metadata", "features_no_sdoh_log_readmit.rds"))
+features_sdoh_log_readmit           <- readRDS(here("data", "metadata", "features_sdoh_log_readmit.rds"))
+
+### "mortality_30_day", "readmitted", "hospital_expire_flag", "length_of_stay"
+
+set.seed(42)
+train_function = "train_single_model3"
+data <- data_hosp
+dataset_name <- "Samp_10"
+target <- "hospital_expire_flag"
+file_name <- "mit_morthosp_feat_sel.csv"
+slices <- 4
+model_run <- "mit_morthosp_feat_sel"
+split_type <- "patient"
+train_size <- 0.7
+cv_splits <- 4
+final_model <- FALSE
+
+```
+
+```{r feat.sel.4.7.morthosp.train}
+
+set.seed(42)
+
+# === Feature Sets
+base_feats  <- features_no_sdoh_log_h_mort
+sdoh_feats  <- features_sdoh_log_h_mort
+
+###########################
+#### XGBoost
+###########################
+
+tuneGrid_xgb <- expand.grid(
+  nrounds = 200,
+  max_depth = 6,
+  eta = 0.3,
+  gamma = 0,
+  colsample_bytree = 1,
+  min_child_weight = 1,
+  subsample = 1
+)
+
+train_and_assign(model_type = "xgbTree", feature_set_name = "Base", selected_features = base_feats, tuneGrid = tuneGrid_xgb)
+save_models(mget(ls(pattern = "^xgbTree_"), inherits = TRUE), "mit_hosp_10", clear = TRUE)
+
+train_and_assign(model_type = "xgbTree", feature_set_name = "Base_SDOH", selected_features = sdoh_feats, tuneGrid = tuneGrid_xgb)
+save_models(mget(ls(pattern = "^xgbTree_"), inherits = TRUE), "mit_hosp_10", clear = TRUE)
+
+###########################
+#### GBM
+###########################
+
+tuneGrid_gbm <- expand.grid(
+  interaction.depth = 3,
+  n.trees = 100,
+  shrinkage = 0.1,
+  n.minobsinnode = 10
+)
+
+train_and_assign(model_type = "gbm", feature_set_name = "Base", selected_features = base_feats, tuneGrid = tuneGrid_gbm)
+save_models(mget(ls(pattern = "^gbm_"), inherits = TRUE), "mit_hosp_10", clear = TRUE)
+
+train_and_assign(model_type = "gbm", feature_set_name = "Base_SDOH", selected_features = sdoh_feats, tuneGrid = tuneGrid_gbm)
+save_models(mget(ls(pattern = "^gbm_"), inherits = TRUE), "mit_hosp_10", clear = TRUE)
+
+###########################
+#### Random Forest
+###########################
+
+tuneGrid_rf <- expand.grid(mtry = 2)
+
+train_and_assign(model_type = "rf", feature_set_name = "Base", selected_features = base_feats, tuneGrid = tuneGrid_rf)
+save_models(mget(ls(pattern = "^rf_"), inherits = TRUE), "mit_hosp_10", clear = TRUE)
+
+train_and_assign(model_type = "rf", feature_set_name = "Base_SDOH", selected_features = sdoh_feats, tuneGrid = tuneGrid_rf)
+save_models(mget(ls(pattern = "^rf_"), inherits = TRUE), "mit_hosp_10", clear = TRUE)
+
+# ###########################
+# #### Neural Network
+# ###########################
+
+tuneGrid_nnet <- expand.grid(size = 5, decay = 0.1)
+
+train_and_assign(model_type = "nnet", feature_set_name = "Base", selected_features = base_feats, tuneGrid = tuneGrid_nnet)
+save_models(mget(ls(pattern = "^nnet_"), inherits = TRUE), "mit_hosp_10", clear = TRUE)
+
+train_and_assign(model_type = "nnet", feature_set_name = "Base_SDOH", selected_features = sdoh_feats, tuneGrid = tuneGrid_nnet)
+save_models(mget(ls(pattern = "^nnet_"), inherits = TRUE), "mit_hosp_10", clear = TRUE)
+
+# ###########################
+# #### Logistic Regression
+# ###########################
+
+# train_and_assign(model_type = "glm", feature_set_name = "Base", selected_features = base_feats, tuneGrid = NULL)
+# save_models(mget(ls(pattern = "^glm_"), inherits = TRUE), "mit_hosp_10", clear = TRUE)
+# 
+# train_and_assign(model_type = "glm", feature_set_name = "Base_SDOH", selected_features = sdoh_feats, tuneGrid = NULL)
+# save_models(mget(ls(pattern = "^glm_"), inherits = TRUE), "mit_hosp_10", clear = TRUE)
+
+# ###########################
+# #### GLMNet (Ridge, Lasso, Elastic Net)
+# ###########################
+
+# tuneGrid_glmnet <- expand.grid(
+#   alpha = .5,
+#   lambda = 0.1
+# )
+# 
+# train_and_assign(model_type = "glmnet", feature_set_name = "Base", selected_features = base_feats, tuneGrid = tuneGrid_glmnet)
+# save_models(mget(ls(pattern = "^glmnet_"), inherits = TRUE), "mit_hosp_10", clear = TRUE)
+# 
+# train_and_assign(model_type = "glmnet", feature_set_name = "Base_SDOH", selected_features = sdoh_feats, tuneGrid = tuneGrid_glmnet)
+# save_models(mget(ls(pattern = "^glmnet_"), inherits = TRUE), "mit_hosp_10", clear = TRUE)
+
+# ###########################
+# #### Bayesian Logistic Regression
+# ###########################
+
+# train_and_assign(model_type = "bayesglm", feature_set_name = "Base", selected_features = base_feats, tuneGrid = NULL)
+# save_models(mget(ls(pattern = "^bayesglm_"), inherits = TRUE), "mit_hosp_10", clear = TRUE)
+# 
+# train_and_assign(model_type = "bayesglm", feature_set_name = "Base_SDOH", selected_features = sdoh_feats, tuneGrid = NULL)
+# save_models(mget(ls(pattern = "^bayesglm_"), inherits = TRUE), "mit_hosp_10", clear = TRUE)
+
+# ###########################
+# #### SVM (Radial)
+# ###########################
+# 
+# # tuneGrid_svm <- expand.grid(C = 1, sigma = 0.05)
+# # 
+# # train_and_assign(model_type = "svmRadial", feature_set_name = "Base", selected_features = base_feats, tuneGrid = tuneGrid_svm)
+# # save_models(mget(ls(pattern = "^svmRadial_"), inherits = TRUE), "mit_hosp_10", clear = TRUE)
+# # 
+# # train_and_assign(model_type = "svmRadial", feature_set_name = "Base_SDOH", selected_features = sdoh_feats, tuneGrid = tuneGrid_svm)
+# # save_models(mget(ls(pattern = "^svmRadial_"), inherits = TRUE), "mit_hosp_10", clear = TRUE)
+
+###########################
+#### Naive Bayes
+###########################
+
+train_and_assign(model_type = "naive_bayes", feature_set_name = "Base", selected_features = base_feats, tuneGrid = NULL)
+save_models(mget(ls(pattern = "^naive_bayes_"), inherits = TRUE), "mit_hosp_10", clear = TRUE)
+
+train_and_assign(model_type = "naive_bayes", feature_set_name = "Base_SDOH", selected_features = sdoh_feats, tuneGrid = NULL)
+save_models(mget(ls(pattern = "^naive_bayes_"), inherits = TRUE), "mit_hosp_10", clear = TRUE)
+
+###########################
+#### K-Nearest Neighbors
+###########################
+
+# tuneGrid_knn <- expand.grid(k = 10)
+# 
+# train_and_assign(model_type = "knn", feature_set_name = "Base", selected_features = base_feats, tuneGrid = tuneGrid_knn)
+# save_models(mget(ls(pattern = "^knn_"), inherits = TRUE), "30_hosp_10", clear = TRUE)
+# 
+# train_and_assign(model_type = "knn", feature_set_name = "Base_SDOH", selected_features = sdoh_feats, tuneGrid = tuneGrid_knn)
+# save_models(mget(ls(pattern = "^knn_"), inherits = TRUE), "30_hosp_10", clear = TRUE)
+
+```
+
+```{r feat.sel.4.7.morthosp}
+
+mit_feature_selection_results_hospmort <- list()
+
+# Load from saved models
+files <- list.files(here("models", "mit_hosp_10"), pattern = "\\.rds$", full.names = TRUE)
+
+for (file in files) {
+  model_name <- sub("\\.rds$", "", basename(file))
+  model_obj <- readRDS(file)
+
+  # if (!grepl("^gbm_base_h", model_name)) {
+  #   message("Skipping model: ", model_name)
+  #   next
+  # }
+  
+    if (grepl("^knn", model_name)) {
+    message("Skipping KNN model: ", model_name)
+    next
+  }
+  
+  message("Feature selection for model: ", model_name)
+
+  model_input <- get_model_data_and_features(model_obj, target = "hospital_expire_flag")
+
+  selected_feats <- feature_selection(
+    model = model_obj,
+    target = "hospital_expire_flag",
+    features = model_input$features,
+    dataset = model_input$data,
+    return_stats = TRUE
+  )
+
+  if ("Overall" %in% colnames(selected_feats)) {
+    selected_names <- selected_feats$feature[selected_feats$Overall > 0]
+  } else {
+    selected_names <- selected_feats$feature
+  }
+
+  removed_feats <- setdiff(model_input$features, selected_names)
+
+  mit_feature_selection_results_hospmort[[model_name]] <- list(
+    selected = selected_feats,
+    removed = removed_feats
+  )
+
+  saveRDS(
+    mit_feature_selection_results_hospmort,
+    here::here("data", "metadata", "mit_feature_selection_results_hospmort.rds")
+  )
+
+  rm(model_obj); gc()  # Clear memory
+}
+
+
+```
+
+```{r feat.sel.4.7.morthosp.review}
+
+mit_feature_selection_results_hospmort <- readRDS(here::here("data", "metadata", "mit_feature_selection_results_hospmort.rds"))
+
+# Get all unique removed features across all models
+all_removed <- unique(unlist(lapply(mit_feature_selection_results_hospmort, function(x) x$removed)))
+
+# Create a matrix: rows = features, cols = models
+removed_matrix <- sapply(names(mit_feature_selection_results_hospmort), function(model_name) {
+  removed <- mit_feature_selection_results_hospmort[[model_name]]$removed
+  all_removed %in% removed
+})
+
+# Convert to data frame
+removed_df <- as.data.frame(removed_matrix)
+rownames(removed_df) <- all_removed
+
+removed_df_pretty <- removed_df
+removed_df_pretty[] <- lapply(removed_df_pretty, function(col) ifelse(col, "X", "-"))
+
+t_4_7_1_removed_hospmort <- removed_df_pretty
+write.csv(t_4_7_1_removed_hospmort, file = "../presentations/figures/t_4_7_1_removed_hospmort_mit.csv", row.names = TRUE, fileEncoding = "UTF-8")
+
+```
+
+```{r tunning.4.7.morthosp.inputs}
+
+# Load Featurte Sets
+source(here("scripts", "feature_sets.R"))
+# Load utilities
+source(here("scripts", "utils.R"))
+
+# Load 20% Data Sample for tuning
+data_hosp <- load_dataset("data_hosp_25_log.rds")
+
+source(here("scripts", "figs_funcs.R"))
+
+features_no_sdoh_log_h_mort         <- readRDS(here("data", "metadata", "features_no_sdoh_log_h_mort.rds"))
+features_sdoh_log_h_mort            <- readRDS(here("data", "metadata", "features_sdoh_log_h_mort.rds"))
+features_no_sdoh_log_30_mort        <- readRDS(here("data", "metadata", "features_no_sdoh_log_30_mort.rds"))
+features_sdoh_log_30_mort           <- readRDS(here("data", "metadata", "features_sdoh_log_30_mort.rds"))
+features_no_sdoh_log_readmit        <- readRDS(here("data", "metadata", "features_no_sdoh_log_readmit.rds"))
+features_sdoh_log_readmit           <- readRDS(here("data", "metadata", "features_sdoh_log_readmit.rds"))
+
+mit_feature_selection_results_hospmort <- readRDS(here("data", "metadata", "mit_feature_selection_results_hospmort.rds"))
+
+set.seed(42)
+train_function = "train_single_model3"
+data <- data_hosp
+dataset_name <- "Samp_25"
+target <- "hospital_expire_flag"
+file_name <- "mit_morthosp_tuning.csv"
+slices <- 4
+model_run <- "mit_Morthosp_tuning"
+split_type <- "patient"
+train_size <- 0.7
+cv_splits <- 4
+final_model <- FALSE
+
+```
+
+```{r tunning.4.7.morthosp.train}
+
+##############################
+### Tunning Grids
+##############################
+
+# XGBoost
+tuneGrid_xgb <- expand.grid(
+  nrounds = c(100, 200),
+  max_depth = c(3, 6, 9),
+  eta = c(0.01, 0.1, 0.3),
+  gamma = 0,
+  colsample_bytree = 1,
+  min_child_weight = 1,
+  subsample = 1
+)
+
+# GBM
+tuneGrid_gbm <- expand.grid(
+  interaction.depth = c(1, 3, 5),
+  n.trees = c(50, 100),
+  shrinkage = c(0.05, 0.1),
+  n.minobsinnode = c(5, 10)
+)
+
+# Random Forest
+tuneGrid_rf <- expand.grid(
+  mtry = c(2) # mtry = c(2, 4, 6, 8)
+)
+
+set.seed(42)
+
+##############################
+### XGBoost (Gradient Boosted Trees)
+##############################
+
+# nrounds = 200; max_depth = 6; eta = 0.1; gamma = 0; colsample_bytree = 1; min_child_weight = 1; subsample = 1
+train_and_assign(
+  model_type = "xgbTree",
+  feature_set_name = "Base_SDOH",
+  selected_features = get_training_ready_features(
+    "xgbTree", "base_sdoh", "hospital_expire_flag", "mit_morthosp_feat_sel", mit_feature_selection_results_hospmort, features_sdoh_log_h_mort),
+  tuneGrid = tuneGrid_xgb
+)
+
+save_models(mget(ls(pattern = "^xgbTree_"), inherits = TRUE), "mit_Morthosp_25", clear = TRUE)
+
+# train_and_assign(
+#   model_type = "xgbTree",
+#   feature_set_name = "Base",
+#   selected_features = get_training_ready_features(
+#     "xgbTree", "base", "hospital_expire_flag", "morthosp_feat_sel", feature_selection_results_hospmort, features_no_sdoh_log_h_mort),
+#   tuneGrid = tuneGrid_xgb
+# )
+
+##############################
+### GBM (Gradient Boosting Machines)
+##############################
+
+# interaction.depth = 5; n.trees = 100; shrinkage = 0.1; n.minobsinnode = 5
+train_and_assign(
+  model_type = "gbm",
+  feature_set_name = "Base_SDOH",
+  selected_features = get_training_ready_features(
+    "gbm", "base_sdoh", "hospital_expire_flag", "mit_morthosp_feat_sel", mit_feature_selection_results_hospmort, features_sdoh_log_h_mort),
+  tuneGrid = tuneGrid_gbm
+)
+
+save_models(mget(ls(pattern = "^gbm"), inherits = TRUE), "mit_Morthosp_25", clear = TRUE)
+
+# train_and_assign(
+#   model_type = "gbm",
+#   feature_set_name = "Base",
+#   selected_features = get_training_ready_features(
+#     "gbm", "base", "hospital_expire_flag", "morthosp_feat_sel", feature_selection_results_hospmort_gbm_base, features_no_sdoh_log_h_mort),
+#   tuneGrid = tuneGrid_gbm
+# )
+
+##############################
+### Random Forest
+##############################
+
+
+train_and_assign(
+  model_type = "rf",
+  feature_set_name = "Base_SDOH",
+  selected_features = get_training_ready_features(
+    "rf", "base_sdoh", "hospital_expire_flag", "mit_morthosp_feat_sel", mit_feature_selection_results_hospmort, features_sdoh_log_h_mort),
+  tuneGrid = tuneGrid_rf
+)
+save_models(mget(ls(pattern = "^rf"), inherits = TRUE), "mit_Morthosp_25", clear = TRUE)
+
+# train_and_assign(
+#   model_type = "rf",
+#   feature_set_name = "Base",
+#   selected_features = get_training_ready_features(
+#     "rf", "base", "hospital_expire_flag", "morthosp_feat_sel", feature_selection_results_hospmort, features_no_sdoh_log_h_mort),
+#   tuneGrid = tuneGrid_rf
+# )
+
+```
+
+```{r final.4.7.morthosp.inputs}
+
+# Load Featurte Sets
+source(here("scripts", "feature_sets.R"))
+# Load utilities
+source(here("scripts", "utils.R"))
+
+# Load 20% Data Sample for tuning
+data_hosp <- load_dataset("data_hosp_50_log.rds")
+
+source(here("scripts", "figs_funcs.R"))
+
+features_no_sdoh_log_h_mort         <- readRDS(here("data", "metadata", "features_no_sdoh_log_h_mort.rds"))
+features_sdoh_log_h_mort            <- readRDS(here("data", "metadata", "features_sdoh_log_h_mort.rds"))
+features_no_sdoh_log_30_mort        <- readRDS(here("data", "metadata", "features_no_sdoh_log_30_mort.rds"))
+features_sdoh_log_30_mort           <- readRDS(here("data", "metadata", "features_sdoh_log_30_mort.rds"))
+features_no_sdoh_log_readmit        <- readRDS(here("data", "metadata", "features_no_sdoh_log_readmit.rds"))
+features_sdoh_log_readmit           <- readRDS(here("data", "metadata", "features_sdoh_log_readmit.rds"))
+
+feature_selection_results_hospmort <- readRDS(here("data", "metadata", "feature_selection_results_hospmort.rds"))
+feature_selection_results_hospmort_gbm_base <- readRDS(here("data", "metadata", "feature_selection_results_hospmort_gbm_base.rds"))
+
+set.seed(42)
+train_function = "train_single_model3"
+data <- data_hosp
+dataset_name <- "Final"
+target <- "hospital_expire_flag"
+file_name <- "morthosp_final.csv"
+slices <- 1
+model_run <- "morthosp_final"
+split_type <- "patient"
+train_size <- 0.7
+cv_splits <- 1
+final_model <- TRUE
+
+```
+
+```{r final.4.7.morthosp.train}
+
+##############################
+### Tunning Grids
+##############################
+
+# XGBoost
+tuneGrid_bestxgb <- expand.grid(
+  nrounds = c(100),
+  max_depth = c(9),
+  eta = c(0.01),
+  gamma = 0,
+  colsample_bytree = 1,
+  min_child_weight = 1,
+  subsample = 1
+)
+
+# GBM
+tuneGrid_bestgbm <- expand.grid(
+  interaction.depth = c(5),
+  n.trees = c(50),
+  shrinkage = c(0.1),
+  n.minobsinnode = c(5)
+)
+
+# Random Forest
+tuneGrid_bestrf <- expand.grid(
+  mtry = c(2) # mtry = c(2, 4, 6, 8)
+)
+
+set.seed(42)
+
+##############################
+### XGBoost (Gradient Boosted Trees)
+##############################
+
+# nrounds = 200; max_depth = 6; eta = 0.1; gamma = 0; colsample_bytree = 1; min_child_weight = 1; subsample = 1
+train_and_assign(
+  model_type = "xgbTree",
+  feature_set_name = "Base_SDOH",
+  selected_features = get_training_ready_features(
+    "xgbTree", "base_sdoh", "hospital_expire_flag", "morthosp_feat_sel", feature_selection_results_hospmort, features_sdoh_log_h_mort),
+  tuneGrid = tuneGrid_bestxgb
+)
+
+save_models(mget(ls(pattern = "^xgbTree_"), inherits = TRUE), "Morthosp_final", clear = TRUE)
+
+train_and_assign(
+  model_type = "xgbTree",
+  feature_set_name = "Base",
+  selected_features = get_training_ready_features(
+    "xgbTree", "base", "hospital_expire_flag", "morthosp_feat_sel", feature_selection_results_hospmort, features_no_sdoh_log_h_mort),
+  tuneGrid = tuneGrid_bestxgb
+)
+
+save_models(mget(ls(pattern = "^xgbTree_"), inherits = TRUE), "Morthosp_final", clear = TRUE)
+
+##############################
+### GBM (Gradient Boosting Machines)
+##############################
+
+# interaction.depth = 5; n.trees = 100; shrinkage = 0.1; n.minobsinnode = 5
+train_and_assign(
+  model_type = "gbm",
+  feature_set_name = "Base_SDOH",
+  selected_features = get_training_ready_features(
+    "gbm", "base_sdoh", "hospital_expire_flag", "morthosp_feat_sel", feature_selection_results_hospmort, features_sdoh_log_h_mort),
+  tuneGrid = tuneGrid_bestgbm
+)
+
+save_models(mget(ls(pattern = "^gbm"), inherits = TRUE), "Morthosp_final", clear = TRUE)
+
+train_and_assign(
+  model_type = "gbm",
+  feature_set_name = "Base",
+  selected_features = get_training_ready_features(
+    "gbm", "base", "hospital_expire_flag", "morthosp_feat_sel", feature_selection_results_hospmort_gbm_base, features_no_sdoh_log_h_mort),
+  tuneGrid = tuneGrid_bestgbm
+)
+
+save_models(mget(ls(pattern = "^gbm"), inherits = TRUE), "Morthosp_final", clear = TRUE)
+
+##############################
+### Random Forest
+##############################
+
+
+train_and_assign(
+  model_type = "rf",
+  feature_set_name = "Base_SDOH",
+  selected_features = get_training_ready_features(
+    "rf", "base_sdoh", "hospital_expire_flag", "morthosp_feat_sel", feature_selection_results_hospmort, features_sdoh_log_h_mort),
+  tuneGrid = tuneGrid_bestrf
+)
+save_models(mget(ls(pattern = "^rf"), inherits = TRUE), "Morthosp_final", clear = TRUE)
+
+train_and_assign(
+  model_type = "rf",
+  feature_set_name = "Base",
+  selected_features = get_training_ready_features(
+    "rf", "base", "hospital_expire_flag", "morthosp_feat_sel", feature_selection_results_hospmort, features_no_sdoh_log_h_mort),
+  tuneGrid = tuneGrid_bestrf
+)
+
+save_models(mget(ls(pattern = "^rf"), inherits = TRUE), "Morthosp_final", clear = TRUE)
+
+```
+
+
+```{r feet.sel.final, fig.show='hold'}
+
+
+
+top_features_list <- readRDS(here("data", "metadata", "feature_selection_results_30mort.rds"))
+# top_features_list <- readRDS(here("data", "metadata", "feature_selection_results_hospmort.rds"))
+# top_features_list <- readRDS(here("data", "metadata", "feature_selection_results_readmit.rds"))
+# top_features_list <- readRDS(here("data", "metadata", "feature_selection_results_los.rds"))
+
+top10_features_list <- lapply(top_features_list, function(model_list) {
+  if (is.list(model_list) && "selected" %in% names(model_list)) {
+    model_list$selected %>%
+      slice_head(n = 10)  #
+  } else {
+    NULL
+  }
+})
+
+top10_features_list <- Filter(Negate(is.null), top10_features_list)
+
+for (model_name in names(top10_features_list)) {
+  df <- top10_features_list[[model_name]]
+  
+  # Check if "Overall" exists
+  if ("Overall" %in% names(df)) {
+    p <- ggplot(df, aes(x = reorder(feature, Overall), y = Overall)) +
+      geom_bar(stat = "identity", fill = "steelblue") +
+      coord_flip() +
+      labs(title = paste("Top 10 Features -", model_name),
+           x = "Feature",
+           y = "Overall Score") +
+      theme_minimal() + 
+      theme(
+        panel.background = element_rect(fill = "white", color = NA),
+        plot.background = element_rect(fill = "white", color = NA)
+      )
+  } else if ("rank" %in% names(df)) {
+    p <- ggplot(df %>% mutate(importance = max(rank) - rank + 1),
+                aes(x = reorder(feature, importance), y = importance)) +
+      geom_bar(stat = "identity", fill = "steelblue") +
+      coord_flip() +
+      labs(title = paste("Top 10 Features -", model_name),
+           x = "Feature",
+           y = "Relative Importance") +
+      theme_minimal() +
+      theme(
+        panel.background = element_rect(fill = "white", color = NA),
+        plot.background = element_rect(fill = "white", color = NA)
+      )
+  } else {
+    warning("no score found for: ", model_name)
+    next
+  }
+
+  ggsave(
+    filename = here::here("presentations", "figures", paste0("f_4.7_top10_", model_name, ".png")),
+    plot = p,
+    width = 6,
+    height = 4,
+    dpi = 300
+  )
+
+  print(p)
+}
+
+```
+
+#### Model Evaluation
+
+```{r ROC.call}
+
+mort30_final <- load_models_to_list(subfolder = "Mort30_final", strip_train = TRUE) # pattern = "^gbm"
+mort30_final <- add_predictions_to_models(mort30_final, target_col = "mortality_30_day")
+save_models(mort30_final, subfolder = "Mort30_final")
+rm(mort30_final)
+
+morthosp_final <- load_models_to_list(subfolder = "Morthosp_final", strip_train = TRUE) # pattern = "^gbm"
+morthosp_final <- add_predictions_to_models(morthosp_final, target_col = "hospital_expire_flag")
+save_models(morthosp_final, subfolder = "Morthosp_final")
+rm(morthosp_final)
+
+readmit_final <- load_models_to_list(subfolder = "Readmit_final", strip_train = TRUE, pattern = "^nnet_") # readmit_final <- add_predictions_to_models(readmit_final, target_col = "readmitted")
+save_models(readmit_final, subfolder = "Readmit_final")
+rm(readmit_final)
+
+```
+
+```{r 4.8.ROC.call}
+
+
+mort30_final <- load_models_to_list(subfolder = "Mort30_final", strip_train = TRUE) # pattern = "^gbm"
+
+mort30_roc <- plot_roc_curves(
+  models = mort30_final,
+  model_names = names(mort30_final),
+  target = "mortality_30_day",
+  plot_title = "30 Day Mortality Prediction"
+)
+rm(mort30_final)
+
+morthosp_final <- load_models_to_list(subfolder = "Morthosp_final", strip_train = TRUE) # pattern = "^gbm"
+
+morthosp_roc <- plot_roc_curves(
+  models = morthosp_final,
+  model_names = names(morthosp_final),
+  target = "hospital_expire_flag",
+  plot_title = "Hospital Mortality Prediction"
+)
+rm(morthosp_final)
+
+# readmit_final <- load_models_to_list(subfolder = "Readmit_final", strip_train = TRUE, pattern = "^bayesglm") # pattern = "^gbm"
+# 
+# readmit_final <- plot_roc_curves(
+#   models = readmit_final,
+#   model_names = names(readmit_final),
+#   target = "readmitted",
+#   plot_title = "30 Day Readmission Prediction"
+# )
+
+```
+
+```{r PR.AUC.call}
+
+
+mort30_final <- load_models_to_list(subfolder = "Mort30_final", strip_train = TRUE) # pattern = "^gbm"
+
+mort30_pr <- plot_pr_curves(
+  models = mort30_final,
+  model_names = names(mort30_final),
+  target = "mortality_30_day",
+  plot_title = "30 Day Mortality Prediction"
+)
+rm(mort30_final)
+
+# Hospital Mortality Models
+morthosp_final <- load_models_to_list(subfolder = "Morthosp_final", strip_train = TRUE) # pattern = "^gbm"
+
+morthosp_pr <- plot_pr_curves(
+  models = morthosp_final,
+  model_names = names(morthosp_final),
+  target = "hospital_expire_flag",
+  plot_title = "Hospital Mortality Prediction"
+)
+rm(morthosp_final)
+
+# # Readmitted Models
+# plot_pr_curves(
+#   models = readmit_models,
+#   model_names = sapply(readmit_models, function(model) model$method),
+#   target = "readmitted",
+#   plot_title = "Hospital Readmission Prediction"
+# )
+
+```
+
+```{r pred.hist.call}
+
+mort30_final <- load_models_to_list(subfolder = "Mort30_final", strip_train = TRUE)
+results_df <- extract_predicted_probs(mort30_final)
+plot_prediction_histograms(results_df)
+
+```
+
+```{r 4.10.x.vs.pred.plot}
+
+source(here("scripts", "feature_sets.R"))
+source(here("scripts", "utils.R"))
+data_hosp <- load_dataset("data_hosp_5.rds")
+source(here("scripts", "figs_funcs.R"))
+
+gbm_final <- load_models_to_list("length_of_stay_final", pattern = "^gbm")
+rf_final <- load_models_to_list("length_of_stay_final", pattern = "^rf")
+xgbTree_final <- load_models_to_list("length_of_stay_final", pattern = "^xgbTree")
+
+# load_models_as_objects("length_of_stay_final", pattern = "^xgbTree")
+
+model_plot_pairs <- list()
+for (model_name in names(gbm_final)) {
+  model <- gbm_final[[model_name]]
+  plots <- evaluate_model(model, target = "length_of_stay", model_name = model_name)
+  model_plot_pairs[[model_name]] <- plots
+
+  save_named_plot(plots$actual_vs_pred, paste0("f_4_10_los_predicted_vs_actual_", model_name))
+  save_named_plot(plots$residual_hist, paste0("f_4_10_los_residual_hist_", model_name))
+}
+rm(list = ls(pattern = "gbm_final"), envir = .GlobalEnv)
+
+
+model_plot_pairs <- list()
+for (model_name in names(rf_final)) {
+  model <- rf_final[[model_name]]
+  plots <- evaluate_model(model, target = "length_of_stay", model_name = model_name)
+  model_plot_pairs[[model_name]] <- plots
+
+  save_named_plot(plots$actual_vs_pred, paste0("f_4_10_los_predicted_vs_actual_", model_name))
+  save_named_plot(plots$residual_hist, paste0("f_4_10_los_residual_hist_", model_name))
+}
+
+rm(list = ls(pattern = "rf_final"), envir = .GlobalEnv)
+rm(list = ls(pattern = "^plots"), envir = .GlobalEnv)
+
+model_plot_pairs <- list()
+for (model_name in names(xgbTree_final)) {
+  model <- xgbTree_final[[model_name]]
+  plots <- evaluate_model(model, target = "length_of_stay", model_name = model_name)
+  model_plot_pairs[[model_name]] <- plots
+
+  save_named_plot(plots$actual_vs_pred, paste0("f_4_10_los_predicted_vs_actual_", model_name))
+  save_named_plot(plots$residual_hist, paste0("f_4_10_los_residual_hist_", model_name))
+}
+
+rm(list = ls(pattern = "xgbTree"), envir = .GlobalEnv)
+gc()
+
+
+```
+
+```{r x.vs.pred.plot.2}
+
+model_files <- list.files(here::here("models", "length_of_stay_final"), 
+                          pattern = "los_100.*\\.rds$", full.names = TRUE)
+
+fit_data_list <- list()
+
+for (file in model_files) {
+  model <- readRDS(file)
+  
+  model_name <- sub("\\.rds$", "", basename(file))
+  test_data <- model$test_data
+  preds <- predict(model, newdata = test_data)
+  
+  fit_data_list[[model_name]] <- data.frame(
+    Predicted = preds,
+    Actual = test_data$length_of_stay,
+    Model = model_name
+  )
+  
+  # Optional: release model to save RAM
+  rm(model)
+  gc()
+}
+
+combined_df <- do.call(rbind, fit_data_list)
+
+
+f_4_10_los_all <- ggplot(combined_df, aes(x = Predicted, y = Actual, color = Model)) +
+  geom_smooth(method = "lm", se = FALSE, linewidth = 1.2) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dotted", color = "grey40", size = 0.7) +
+  ggtitle("LOS Actual vs. Predicted Fit Lines") +
+  xlab("Predicted LOS") + ylab("Actual LOS") +
+  theme_minimal() +
+    theme(legend.position = "bottom",
+      panel.background = element_rect(fill = "white", color = NA),
+      plot.background = element_rect(fill = "white", color = NA)
+    )
+
+
+save_named_plot(f_4_10_los_all, "f_4_10_los_all", width = 9, height = 9, dpi = 400)
+
+
+```
+
+
